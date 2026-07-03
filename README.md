@@ -2,103 +2,113 @@
 
 **An atomic, GitHub-native mutex for multi-agent work. The lock IS a git ref — no server, no database, first writer wins.**
 
-When many agents (Claude, Codex, humans, CI jobs — anything) work the same repo, they collide: two of them grab the same issue and duplicate or clobber each other's work. `gh-issue-lease` gives every agent one command to run before touching an issue. It leases the issue atomically, so exactly one wins.
+When many agents (Claude, Codex, humans, CI — anything) work the same repo, they collide: two grab the same issue and duplicate or clobber each other. `gh-issue-lease` gives every worker one atomic operation to run before touching an issue, so exactly one wins.
 
 ```sh
-npx gh-issue-lease claim 1234   # → "won" (go), "held by …" (pick another), or "degraded" (proceed)
+AGENT_ID=my-agent npx gh-issue-lease claim 1234   # "won" (go), "held by …" (pick another)
 ```
 
-Zero runtime dependencies. One small file. It only needs the [`gh` CLI](https://cli.github.com/) authenticated.
+Zero runtime dependencies, one small file. Needs the [`gh` CLI](https://cli.github.com/) authenticated.
 
 ---
 
 ## How it works (and why there's no database)
 
-The lock **is** a git ref: `refs/leases/issue-<N>`. Creating a ref is **atomic on GitHub's backend** — the first `POST /git/refs` gets HTTP `201`, and every later one gets `422 "Reference already exists"`. That one guarantee is the entire primitive: a real server-side mutex with nothing to run.
+The lock **is** a git ref: `refs/leases/issue-<N>`. Creating a ref is **atomic on GitHub's backend** — the first `POST /git/refs` gets `201`, every later one gets `422 "Reference already exists"`. That's the whole primitive: a real server-side mutex with nothing to run. The ref points at a tiny commit whose message carries `{owner, ttlMin}` and whose GitHub-set date is the lease clock, so a crashed agent's lease **expires and is reclaimed** on its own.
 
-The ref points at a tiny root commit whose message carries `{owner, ttlMin}` and whose GitHub-set commit date is the lease clock. So a crashed agent's lease **expires on its own** and the next claimer reclaims it. No heartbeat process, no lock table, no service.
-
-> **Why not ship an embedded database?** A mutex only works if every agent sees the *same* lock. GitHub is the shared, atomic, already-authenticated store every agent can already reach. An embedded DB (SQLite) is per-machine — two agents on two machines each get their *own* copy and can't see each other's locks, so it can't be the shared store. GitHub already is. (For single-host fleets or scale past GitHub's rate limit, see [Scaling](#scaling) — the answer is a backend swap, still never an embedded DB.)
+> **Why not an embedded database?** A mutex only works if every worker sees the *same* lock. GitHub is the shared, atomic, already-authenticated store everyone can already reach. An embedded DB (SQLite) is per-machine and can't be that shared store. GitHub already is.
 
 ---
 
-## Install
+## Identity is strict and agent-agnostic
+
+The owner of a lease is **`AGENT_ID`** — a unique label the **launcher** sets per logical agent. This one rule makes the hard cases disappear:
+
+- **Parent → children(N).** A parent that fans out into *N* child agents/threads/processes: every child **inherits `AGENT_ID` through the environment**, so the parent and all N children are **one owner**. The claim is idempotent for that owner — child #1 wins it, children #2…N each re-see it as theirs and proceed, none of them ever blocks a sibling.
+- **Independent agents.** Two separate workers have different `AGENT_ID`s → different owners → the second is correctly excluded.
+- **Any provider.** It's just an env var — Claude, Codex, a human, a CI job all set it identically. Nothing Claude-specific.
+
+There is **no host/user/session fallback**. An unset `AGENT_ID` means *no identity*, and the tool **fails closed** (refuses to claim) rather than guess — guessing would either split a parent from its own children or merge two independent agents. Set it once per agent at launch:
 
 ```sh
-# one-off, no install:
-npx gh-issue-lease <command>
-
-# or as a dev dependency / global:
-npm i -D gh-issue-lease
-npm i -g gh-issue-lease
+export AGENT_ID="fleet-agent-7"   # children inherit this automatically
 ```
-
-Requires the `gh` CLI, authenticated with push access to the repo (`gh auth login`).
 
 ---
 
-## Commands
+## Enforce WITHOUT hooks (the default, and the strongest guarantee)
+
+**The primitive is the enforcement.** `claim` is atomic on GitHub's backend — if it doesn't return `won`, another owner has the issue and you stop. That's the whole mechanism, and it needs **no hooks, no daemon, no config on any agent's machine.** Just run it before you touch an issue:
+
+```sh
+gh-issue-lease claim 1234 || exit 1     # exit 1 = "held by someone else" → don't start
+```
+
+| `claim` exit | Meaning | What the caller does |
+|---|---|---|
+| `0` `won` | Lease is yours (fresh, already yours, or stolen from an expired holder) | Proceed. |
+| `1` `held` | A live lease is held by a **different** `AGENT_ID` | Stop; pick another issue. |
+| `3` | `AGENT_ID` unset | Fails **closed** — set an identity, don't guess. |
+| `0` `degraded` | `gh` offline/unauthed | Fails **open** — proceed unlocked; never blocks work on an infra blip. |
+
+Wire it into whatever the agent already reads. For any agent that honors an instructions file (Claude's `CLAUDE.md`, Codex/others' `AGENTS.md`), one line is the entire integration — no provider API, no hook:
+
+```md
+Before working an issue, run `gh-issue-lease claim <N>`. If it prints "held by …", pick another issue.
+```
+
+Because the lock is a server-side atomic ref, this is race-proof across machines and providers. Everything below is **optional** and only adds convenience or a local backstop — none of it changes the guarantee above.
+
+### Commands
 
 | Command | Exit | Meaning |
 |---|---|---|
-| `claim <N>` | `0` won/degraded · `1` held | Lease issue N. **Run this before you work an issue.** |
-| `release <N>` | `0` | Drop the lease (unconditional). Usually run on merge. |
-| `renew <N>` | `0` renewed · `1` held | Heartbeat — re-stamp your lease for a task that outlasts the TTL. |
-| `status [<N>]` | `0` | Who holds what (all leases, or one). |
-| `reap` | `0` | Delete expired + closed-issue leases. Run from a cron or opportunistically. |
-| `guard-push <branch>` | `0` allowed · `1` blocked | Used by the pre-push hook (below). |
-
-`claim` prints one of `won` / `held by <owner>` / `degraded`:
-
-- **won** — you hold it. Proceed.
-- **held by …** — someone else holds a *live* lease. Pick another issue.
-- **degraded** — `gh` is offline/unauthed. The tool **fails open**: proceed *without* a lease rather than block you. Rare-collision risk is accepted over halting all work on an infra blip.
-
-### Programmatic API
-
-```js
-import { claim, release, renew } from "gh-issue-lease";
-
-const r = claim(1234);              // { result: "won" | "held" | "degraded", holder? }
-if (r.result === "held") console.log(`taken by ${r.holder.owner}`);
-```
+| `claim <N>` | `0` won/degraded · `1` held · `3` no AGENT_ID | Lease issue N. Run before working it. |
+| `release <N>` | `0` | Drop the lease. |
+| `renew <N>` | `0` renewed · `1` held · `3` no id | Heartbeat for a task that outlasts the TTL. |
+| `status [<N>]` | `0` | Who holds what (great as a CI/observability step). |
+| `reap` | `0` | Delete expired + closed-issue leases. |
+| `guard-push <branch>` | `0` allowed · `1` blocked | Read-only ownership check (used by the optional pre-push hook). |
+| `hook` / `codex-hook` / `claude-hook [--block]` | `0` | Optional provider adapters (below). |
 
 ---
 
-## Enforcement (make it not-optional)
+## Optional: hooks (all opt-in, all covered by the install test suite)
 
-Leasing only helps if agents actually do it. The `pre-push` hook makes it **mechanical** — it rejects pushing a branch `<type>/<N>-<slug>` whose issue is leased by someone else:
+Hooks are a **backstop for the human/agent who forgets to `claim`** — never the primary mechanism. Every one is gated off by default and exits `0` (never blocks) when `gh` is offline or `AGENT_ID` is unset. `test/install.test.mjs` packs the real tarball and exercises the shipped hook end-to-end, so what you install is what's tested.
+
+**Local pre-push teeth** — rejects pushing a `<type>/<N>-<slug>` branch whose issue a *different* owner holds:
 
 ```sh
-mkdir -p .githooks
 cp node_modules/gh-issue-lease/hooks/pre-push .githooks/pre-push
 chmod +x .githooks/pre-push
 git config core.hooksPath .githooks
+git config issueLease.enforce true      # opt-in; unset/false = disabled
 ```
 
-Non-issue branches pass. `gh` offline passes. Bypass a single push with `git push --no-verify`; disable entirely with `git config issueLease.enforce false`. Because the rule is in the hook (not in any one agent's prompt), it binds **every** agent identically — Claude, Codex, Tony, or a human.
+Non-issue branches pass; `gh` offline passes; bypass once with `git push --no-verify`.
 
----
+**Claude Code** — the only provider whose hook can *deny* an edit in-flight. `.claude/settings.json`:
 
-## Identity
-
-Set `AGENT_ID` to a **unique** label per agent so leases are attributable and idempotent-retry works:
-
-```sh
-export AGENT_ID="codex-worker-7"
+```json
+{
+  "hooks": {
+    "SessionStart": [{ "hooks": [{ "type": "command", "command": "gh-issue-lease claude-hook" }] }],
+    "PreToolUse": [{ "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+      "hooks": [{ "type": "command", "command": "gh-issue-lease claude-hook --block" }] }]
+  }
+}
 ```
 
-Without it, the owner falls back to `user@host` (fine for a single human; the CLI warns). At scale a unique `AGENT_ID` is required — two agents sharing an owner are indistinguishable, and the "I already hold it" fast-path would wrongly let both proceed.
+`SessionStart` claims the branch's issue and drops a per-worktree marker; `PreToolUse` reads that marker and allows with **zero network calls** on the hot path (owner editing its own issue) — only a foreign issue does a network check.
 
----
+**Codex** — its `notify` fires *after* a turn, so it **cannot block** (that's a Codex limitation, not ours; the pre-push hook is the teeth for Codex). It's still useful as an auto-claim + heartbeat so a long session never lets its lease lapse. In `~/.codex/config.toml`:
 
-## Scaling
+```toml
+notify = ["gh-issue-lease", "codex-hook"]
+```
 
-The primitive is correct at any size; the ceiling is **GitHub's rate limit — which is per token (5,000 req/hr).**
-
-- **Give each agent its own auth** (a PAT or a GitHub App installation token). Then limits are per-agent and `claim` — only ~2 writes, fired once per issue-pickup, not in a loop — is nowhere near the budget. Sharing one token across a large fleet is the only thing that hits the wall.
-- **Transient failures back off automatically** with exponential backoff + jitter (`GH_ISSUE_LEASE_MAX_RETRY`, default 5), so a herd contending on one hot issue self-spaces instead of hammering in lockstep.
-- **Past GitHub's ceiling** (thousands of agents, high churn): the `gh` calls live behind a small internal backend seam. A *networked* backend (Redis/Postgres) can replace it without changing the primitive — still shared, still never embedded. A single-host fleet can use a filesystem-lock backend (atomic `O_EXCL`, zero deps). The default install stays zero-dep.
+**Anything else** (Cursor, a shell `PROMPT_COMMAND`, a CI step) — the generic `gh-issue-lease hook` claims/heartbeats the current branch's issue and exits `0`. It's throttled by the marker to at most one GitHub write per `TTL/3`.
 
 ---
 
@@ -106,24 +116,21 @@ The primitive is correct at any size; the ceiling is **GitHub's rate limit — w
 
 | Case | Behaviour |
 |---|---|
-| Two agents claim at once | Exactly one gets `201` (won); the other gets `422` and yields. **Atomic — the core guarantee.** |
-| Agent crashes holding a lease | Lease expires after `AGENT_LEASE_TTL_MIN` (default 240m); next claimer reclaims it. |
-| Legit task outlasts the TTL | Call `renew <N>` periodically to re-stamp the clock. Crashed agents don't renew, so they still free up. |
-| Network blip after the ref was actually created | Retry sees `422`, checks owner, finds it's **you** → returns `won`. Claim is idempotent. |
-| Stealing an expired lease | Best-effort delete-then-recreate. GitHub refs have **no compare-and-swap**, so the hard guarantee stays the atomic *create*; the delete is a tiny TOCTOU window. Keep the TTL conservative. |
-| Thousands of live leases | `status`/`reap` paginate. |
-| `gh` offline / unauthed | Fails open — proceed without a lease (never blocks work). Enforcement hook also passes. |
-| Non-integer / injected issue number | Rejected before any API call. |
-| Branch protection | Leases live under `refs/leases/*`, not `refs/heads/*`, so branch protection doesn't apply. An org ruleset targeting `refs/**` could block ref creation — scope it to exclude `refs/leases/*`. |
-| Fork PRs | Leasing needs push access to the coordination repo; fork-only contributors can't lease. Intended for trusted agent fleets. |
-
----
+| Two independent agents claim at once | Exactly one `201` (won); the other `422` (held). Atomic — the core guarantee. |
+| Parent + its sub-agents (same `AGENT_ID`) | Idempotent — all "win", never block each other. |
+| No `AGENT_ID` set | `claim` fails **closed** (exit 3); hook warns but never blocks; `guard-push` blocks a foreign-held issue you can't prove is yours. |
+| Agent crashes holding a lease | Expires after `AGENT_LEASE_TTL_MIN` (default 240m); next claimer reclaims it. |
+| Task outlasts the TTL | `renew <N>` re-stamps the clock; crashed agents don't renew. |
+| Network blip after the ref was created | Retry sees `422`, owner is you → `won`. Idempotent. |
+| Stealing an expired lease | Best-effort delete+recreate; GitHub refs have no CAS, so the hard guarantee stays the atomic *create*. Keep TTL conservative. |
+| `gh` offline / unauthed | Fails **open** — never blocks work. |
+| Two machines, identical `AGENT_ID` | They'd collude — `AGENT_ID` must be **unique per agent**. |
 
 ## Config
 
 | Env | Default | Purpose |
 |---|---|---|
-| `AGENT_ID` | `user@host` | Unique owner label per agent. |
+| `AGENT_ID` | *(required)* | Unique owner per agent; children inherit it. |
 | `AGENT_LEASE_TTL_MIN` | `240` | Minutes before a lease is stealable. |
 | `ISSUE_LEASE_NAMESPACE` | `leases` | Ref namespace → `refs/<ns>/issue-<N>`. |
 | `GH_ISSUE_LEASE_MAX_RETRY` | `5` | Backoff attempts on rate-limit / 5xx. |

@@ -3,35 +3,42 @@
 //
 // The lock IS a git ref: `refs/leases/issue-<N>`. Creating a ref is atomic on
 // GitHub's backend, so the FIRST writer gets HTTP 201 and everyone else gets 422
-// "Reference already exists". That single fact is the whole primitive — a real
-// server-side mutex with no database, no service, and no state you have to run.
+// "Reference already exists". That one fact is the whole primitive — a real
+// server-side mutex with no database and nothing to run.
 //
-// The ref points at a tiny root commit whose message carries {v,issue,owner,ttlMin}
-// and whose GitHub-set commit date is the lease clock. A crashed agent's lease
-// therefore expires on its own, and the next claimer reclaims it. No heartbeat
-// required — though `renew` is provided for tasks that legitimately outlast the TTL.
-//
-// WHY NOT A DATABASE: a mutex only works if every agent sees the SAME lock. GitHub
-// is the shared, atomic, already-authenticated store every agent can already reach.
-// An embedded DB (SQLite) is per-machine and cannot be that shared store. The gh
-// calls live behind a small `backend` seam so a local-fs backend (single-host) or a
-// networked backend (extreme scale) can drop in — but the default install is zero-dep.
+// IDENTITY IS STRICT AND AGENT-AGNOSTIC. The owner of a lease is `AGENT_ID`, a
+// unique label the LAUNCHER sets per logical agent. Child sub-agents/threads/procs
+// INHERIT it through the environment, so a parent and the helpers it spawns are ONE
+// owner (they never block each other), while two independent agents are always two
+// owners (real collisions are caught). There is no host/user/session fallback: an
+// unset AGENT_ID means "no identity", and we FAIL CLOSED (refuse to claim) rather
+// than guess — guessing would either split a parent from its own children or merge
+// two independent agents. AGENT_ID is just an env var, so Claude, Codex, a human, or
+// a CI job all participate identically.
 //
 // Commands:
-//   claim <N>     0 = won/degraded, 1 = held by someone else
-//   release <N>   drop the lease (unconditional)
-//   renew <N>     re-stamp my lease's clock (heartbeat for long tasks)
+//   claim <N>     0 won · 1 held · 3 no AGENT_ID · (degraded→0, proceed unlocked)
+//   release <N>   drop the lease
+//   renew <N>     re-stamp your lease clock (heartbeat for long tasks)
 //   status [<N>]  who holds what
 //   reap          delete expired + closed-issue leases
-//   guard-push <branch>   pre-push hook: 0 = allowed, 1 = blocked
+//   guard-push <branch>   pre-push gate: 0 allowed · 1 blocked (the UNIVERSAL teeth)
+//   hook          generic provider hook: claim+heartbeat the current branch's issue
+//   codex-hook    Codex `notify` adapter (tolerates Codex's JSON argv; = hook)
+//   claude-hook [--block] Claude Code adapter (SessionStart claim; PreToolUse can DENY)
 //
-// Env: AGENT_ID (owner label — set this per agent), AGENT_LEASE_TTL_MIN (default 240),
-//      ISSUE_LEASE_NAMESPACE (ref namespace, default "leases"),
-//      GH_ISSUE_LEASE_MAX_RETRY (backoff attempts on rate-limit/5xx, default 5).
+// PROVIDER HOOKS DIFFER IN POWER, ON PURPOSE. Claude's PreToolUse can DENY an edit;
+// Codex's notify can only observe (it fires after a turn, cannot block). So the real
+// enforcement is `guard-push` in a git pre-push hook — it binds Claude, Codex, humans
+// and CI identically. Provider hooks are convenience on top of that universal gate.
+//
+// Env: AGENT_ID (required to claim), AGENT_LEASE_TTL_MIN (default 240),
+//      ISSUE_LEASE_NAMESPACE (default "leases"), GH_ISSUE_LEASE_MAX_RETRY (default 5).
 
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { realpathSync, readFileSync } from "node:fs";
+import { realpathSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 const DEFAULT_TTL_MIN = Number(process.env.AGENT_LEASE_TTL_MIN) || 240;
 const NAMESPACE = (process.env.ISSUE_LEASE_NAMESPACE || "leases").replace(/^\/+|\/+$/g, "");
@@ -42,15 +49,10 @@ const MAX_RETRY = Number(process.env.GH_ISSUE_LEASE_MAX_RETRY) || 5;
 export function refShort(n) { return `${NAMESPACE}/issue-${n}`; }        // for git/ref/<this>
 export function refFull(n) { return `refs/${NAMESPACE}/issue-${n}`; }    // for creating
 
-// A stable, attributable owner label. AGENT_ID is the identity key at scale and
-// MUST be unique per agent — if two agents share an owner they are indistinguishable
-// and idempotent-claim (owner===me → won) will wrongly let both proceed. buildOwner
-// falls back to user@host so a single human still gets attribution; the CLI warns.
-export function buildOwner(env = process.env) {
-  if (env.AGENT_ID) return env.AGENT_ID;
-  const who = env.USER || env.LOGNAME || "agent";
-  const host = (env.HOSTNAME || "").split(".")[0];
-  return host ? `${who}@${host}` : who;
+// Strict identity: AGENT_ID or nothing. Trimmed; blank → null ("no identity").
+export function resolveOwner(env = process.env) {
+  const id = (env.AGENT_ID || "").trim();
+  return id || null;
 }
 
 export function parseLeaseMessage(message) {
@@ -64,81 +66,91 @@ export function isExpired(claimedAtISO, ttlMin, nowMs) {
   return nowMs - claimed > ttlMin * 60_000;
 }
 
-// Positive-integer issue numbers only — this is what becomes the ref name, so a
-// non-integer must never reach the API. Returns null for anything invalid.
+// Positive-integer issue numbers only — this becomes the ref name.
 export function normalizeIssue(n) {
   const x = Number(n);
   return Number.isInteger(x) && x > 0 ? x : null;
 }
 
-// Backoff schedule with jitter, so a thundering herd of agents self-spaces instead
-// of retrying in lockstep. Exposed for tests; pure given a rng.
+// Backoff with jitter so a herd of agents self-spaces instead of retrying in lockstep.
 export function backoffMs(attempt, rng = Math.random) {
   const base = Math.min(1000 * 2 ** attempt, 30_000);
   return Math.round(base / 2 + rng() * (base / 2));
 }
 
-// ---------- backend seam ----------
-// Everything below talks to GitHub only through `gh()`. Swapping this object for a
-// local-fs or networked implementation is how the package would scale past GitHub's
-// per-token rate limit without changing the primitive. Default: the github backend.
+// Extract the issue number from a branch (`<type>/<N>-<slug>` or `issue-<N>`).
+// Returns null for non-issue branches — they are not gated.
+export function issueFromBranch(branch) {
+  const m = String(branch).match(/(?:^|\/)(?:issue-)?(\d+)-/) || String(branch).match(/issue-(\d+)/);
+  return m ? Number(m[1]) : null;
+}
+
+// PURE decision: given who I am and the current lease holder, may I push this branch?
+// Fail-open on "no holder" (a missing claim is not a conflict) and on unknown holder
+// only when it's me. Blocks when someone else holds it, or when a lease exists but I
+// have no identity to prove it's mine.
+export function pushDecision({ me, holder }) {
+  if (!holder) return { allow: true };
+  if (me && holder.owner === me) return { allow: true };
+  const why = !me
+    ? `issue is leased by ${holder.owner || "another agent"} and AGENT_ID is unset, so ownership can't be verified`
+    : `issue is leased by ${holder.owner || "another agent"}`;
+  return { allow: false, reason: why };
+}
+
+// PURE decision: what should the provider hook (e.g. Claude) do, given identity, the
+// issue, whether it's a blocking call, and the claim outcome?
+//   no-identity : AGENT_ID unset → warn, never block (the git layer is the backstop)
+//   noop        : not an issue branch, or gh degraded → do nothing
+//   deny        : someone else holds it AND this is a blocking (edit) call
+//   warn        : someone else holds it, non-blocking call
+//   held        : I hold it (fresh, stolen, or already mine)
+export function hookDecision({ me, n, block, claim }) {
+  if (!me) return { kind: "no-identity" };
+  if (!n) return { kind: "noop" };
+  if (!claim || claim.result === "degraded") return { kind: "noop" };
+  if (claim.result === "held" && claim.holder && claim.holder.owner !== me)
+    return { kind: block ? "deny" : "warn", issue: n, holder: claim.holder.owner };
+  return { kind: "held", issue: n, owner: me };
+}
+
+// ---------- gh plumbing (the only I/O; everything above is pure) ----------
 
 function ghRaw(args, input) {
   const r = spawnSync("gh", args, { input, encoding: "utf8" });
   return { status: r.status, out: (r.stdout || "").trim(), err: (r.stderr || "").trim() };
 }
-
-// Is this stderr a transient failure worth backing off and retrying?
 function isTransient(err) {
   return /rate limit|secondary rate|abuse|\b5\d\d\b|timeout|timed out|EAI_AGAIN|ECONNRESET|temporarily/i.test(err);
 }
+const sleep = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* no SAB → skip */ } };
 
-// Synchronous sleep with no CPU spin — Atomics.wait blocks the thread cleanly.
-// (The CLI is a short-lived synchronous process; spawnSync above is already blocking.)
-const sleep = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* SAB unavailable → skip the wait */ } };
-
+// `{owner}`/`{repo}` are filled by gh from the current repo — no slug lookup, one
+// fewer subprocess on every single call.
 function gh(method, path, body, { retry = MAX_RETRY } = {}) {
-  const args = ["api", "--method", method, `repos/${slug()}/${path}`];
+  const args = ["api", "--method", method, `repos/{owner}/{repo}/${path}`];
   if (body) args.push("--input", "-");
   const input = body ? JSON.stringify(body) : undefined;
   let last;
   for (let attempt = 0; attempt <= retry; attempt++) {
     last = ghRaw(args, input);
     if (last.status === 0) return last;
-    // "already exists" and other 4xx business errors are terminal — do not retry.
-    if (/already exists/i.test(last.err)) return last;
+    if (/already exists/i.test(last.err)) return last;     // terminal business error
     if (!isTransient(last.err) || attempt === retry) return last;
     sleep(backoffMs(attempt));
   }
   return last;
 }
 
-let SLUG = null;
-function slug() {
-  if (SLUG) return SLUG;
-  const r = ghRaw(["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"]);
-  if (r.status !== 0) throw new Error("gh unavailable");
-  return (SLUG = r.out);
-}
-
-let DEFAULT_BRANCH = null;
-function defaultBranch() {
-  if (DEFAULT_BRANCH) return DEFAULT_BRANCH;
-  const r = ghRaw(["repo", "view", "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"]);
-  if (r.status !== 0 || !r.out) throw new Error("cannot resolve default branch");
-  return (DEFAULT_BRANCH = r.out);
-}
-
 let TREE = null;
-// Reuse the default branch's existing tree so a lease commit creates no new tree
-// object (tiny, GC-friendly). Cached per process.
+// Any existing tree sha works as the lease commit's tree (it carries no files).
+// `commits/HEAD` returns the default branch tip's tree in ONE call.
 function baseTree() {
   if (TREE) return TREE;
-  const ref = gh("GET", `git/ref/heads/${defaultBranch()}`);
-  const tip = JSON.parse(ref.out).object.sha;
-  return (TREE = JSON.parse(gh("GET", `git/commits/${tip}`).out).tree.sha);
+  const r = gh("GET", "commits/HEAD");
+  if (r.status !== 0) throw new Error("gh unavailable");
+  return (TREE = JSON.parse(r.out).commit.tree.sha);
 }
-
 function getHolder(n) {
   const ref = gh("GET", `git/ref/${refShort(n)}`);
   if (ref.status !== 0) return null;
@@ -146,8 +158,6 @@ function getHolder(n) {
   const commit = JSON.parse(gh("GET", `git/commits/${sha}`).out);
   return { ...parseLeaseMessage(commit.message), claimedAt: commit.committer.date, sha };
 }
-
-// Create the lease commit + ref. Returns {result:'won'|'held'|'degraded'}.
 function mkRef(n, message) {
   const c = gh("POST", "git/commits", { message, tree: baseTree() });
   if (c.status !== 0) return { result: "degraded" };
@@ -160,13 +170,12 @@ function mkRef(n, message) {
 
 // ---------- primitive ----------
 
-// claim — the atomic operation. Returns {result:'won'|'held'|'degraded', holder?}.
-//   won      : you hold the lease (freshly, by steal, or you already held it)
-//   held     : someone else holds a live lease — `holder` describes them
-//   degraded : gh is offline/unauthed — caller should PROCEED WITHOUT a lease
-export function claim(n, { ttlMin = DEFAULT_TTL_MIN, owner = buildOwner() } = {}) {
+// claim — atomic. Returns {result, holder?}:
+//   won | held | degraded (gh offline → proceed unlocked) | no-identity (AGENT_ID unset)
+export function claim(n, { ttlMin = DEFAULT_TTL_MIN, owner = resolveOwner() } = {}) {
   const issue = normalizeIssue(n);
   if (issue === null) throw new Error(`invalid issue number: ${n}`);
+  if (!owner) return { result: "no-identity" };
   let message;
   try { baseTree(); message = JSON.stringify({ v: 1, issue, owner, ttlMin }); }
   catch { return { result: "degraded" }; }
@@ -174,15 +183,12 @@ export function claim(n, { ttlMin = DEFAULT_TTL_MIN, owner = buildOwner() } = {}
   const first = mkRef(issue, message);
   if (first.result !== "held") return first;
 
-  // Contended. Re-read the current holder to decide.
   const holder = getHolder(issue);
-  if (!holder) return mkRef(issue, message);          // vanished between calls → retry create
-  if (holder.owner === owner) return { result: "won", holder };  // idempotent: already mine
+  if (!holder) return mkRef(issue, message);                          // vanished → retry
+  if (holder.owner === owner) return { result: "won", holder };       // idempotent: already mine (parent↔child)
   if (!isExpired(holder.claimedAt, holder.ttlMin, Date.now())) return { result: "held", holder };
 
-  // Expired → best-effort steal. NOTE: GitHub refs have no compare-and-swap, so the
-  // hard guarantee remains the atomic create below; the delete is a tiny TOCTOU window.
-  gh("DELETE", `git/refs/${refShort(issue)}`);
+  gh("DELETE", `git/refs/${refShort(issue)}`);                        // expired → best-effort steal
   const second = mkRef(issue, message);
   if (second.result !== "held") return second;
   const now = getHolder(issue);
@@ -190,12 +196,10 @@ export function claim(n, { ttlMin = DEFAULT_TTL_MIN, owner = buildOwner() } = {}
   return { result: "held", holder: now };
 }
 
-// renew — heartbeat for a task that legitimately outlasts its TTL. Re-stamps the
-// lease clock IF you still own it (or it already expired). Force-updates the ref to a
-// fresh commit. Returns {result:'renewed'|'held'|'degraded'}.
-export function renew(n, { ttlMin = DEFAULT_TTL_MIN, owner = buildOwner() } = {}) {
+export function renew(n, { ttlMin = DEFAULT_TTL_MIN, owner = resolveOwner() } = {}) {
   const issue = normalizeIssue(n);
   if (issue === null) throw new Error(`invalid issue number: ${n}`);
+  if (!owner) return { result: "no-identity" };
   const holder = getHolder(issue);
   if (holder && holder.owner !== owner && !isExpired(holder.claimedAt, holder.ttlMin, Date.now()))
     return { result: "held", holder };
@@ -217,7 +221,6 @@ export function release(n) {
   catch { return false; }
 }
 
-// list — every live lease number, paginated (thousands of concurrent leases are fine).
 export function listLeases() {
   const out = [];
   for (let page = 1; ; page++) {
@@ -234,19 +237,9 @@ export function listLeases() {
   return out;
 }
 
-// Extract the issue number from a branch made off a lease (`<type>/<N>-<slug>` or
-// `issue-<N>`). Returns null for non-issue branches — they are not gated.
-export function issueFromBranch(branch) {
-  const m = String(branch).match(/(?:^|\/)(?:issue-)?(\d+)-/) || String(branch).match(/issue-(\d+)/);
-  return m ? Number(m[1]) : null;
-}
-
 // ---------- CLI ----------
 
-function warnOwnerFallback() {
-  if (!process.env.AGENT_ID)
-    console.error("⚠ AGENT_ID unset — using user@host for attribution. Set a unique AGENT_ID per agent at scale.");
-}
+const IDENTITY_HINT = "Set a unique AGENT_ID per agent (child sub-agents inherit it), e.g. export AGENT_ID=codex-7";
 
 function cmdStatus(n) {
   const nums = n ? [normalizeIssue(n)].filter(Boolean) : listLeases();
@@ -277,91 +270,167 @@ function cmdReap() {
   return 0;
 }
 
-// claude-hook — a Claude Code hook entrypoint. Reads Claude's hook JSON on stdin,
-// derives the current branch's issue, and claims it automatically — so a Claude
-// agent leases its issue without ever thinking about locks. Owner defaults to the
-// Claude session id, so concurrent sessions are distinct and attributable.
-//   SessionStart / UserPromptSubmit : inject a context line (won or held-by-other).
-//   PreToolUse with --block         : DENY the edit if another agent holds the lease.
+// A per-worktree "I hold #N" marker inside the worktree's git dir. Parent and its
+// child sub-agents share the worktree → share this file, so after SessionStart the
+// per-edit PreToolUse check is a local file read (~0 network) instead of a GitHub
+// round-trip. Trusted only within the lease TTL, so it can never outlive the lease.
+function markerFile(cwd) {
+  const r = spawnSync("git", ["-C", cwd, "rev-parse", "--absolute-git-dir"], { encoding: "utf8" });
+  return r.status === 0 && r.stdout.trim() ? join(r.stdout.trim(), "gh-issue-lease-hold.json") : null;
+}
+function readMarker(file) { try { return JSON.parse(readFileSync(file, "utf8")); } catch { return null; } }
+function writeMarker(file, issue, owner) {
+  try { writeFileSync(file, JSON.stringify({ issue, owner, ttlMin: DEFAULT_TTL_MIN, at: Date.now() })); } catch { /* best effort */ }
+}
+function currentBranch(cwd) {
+  const br = spawnSync("git", ["-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"], { encoding: "utf8" });
+  return br.status === 0 ? br.stdout.trim() : "";
+}
+
+// PURE: Codex's `notify` passes a single JSON string as an argv. We only need it to
+// not crash and to surface an optional cwd; unparseable/absent → {}.
+export function codexEvent(argv) {
+  const jsonArg = (argv || []).find((a) => typeof a === "string" && a.trim().startsWith("{"));
+  if (!jsonArg) return {};
+  try { return JSON.parse(jsonArg); } catch { return {}; }
+}
+
+// The generic, provider-agnostic hook: claim (or heartbeat-renew) the current
+// branch's issue as AGENT_ID and refresh the local marker. Advisory only — always
+// exits 0, never blocks (only Claude's PreToolUse can block; that path is separate).
+// Throttled by the marker so a chatty per-turn hook does at most one GitHub write per
+// TTL/3, and never re-checks the network while the lease demonstrably can't have
+// expired. This is what Codex notify, a shell PROMPT_COMMAND, Cursor, or CI all call.
+function holdCurrentBranch(cwd) {
+  const me = resolveOwner();
+  if (!me) { console.error(`⚠ AGENT_ID is not set — issue-lease protection is DISABLED for this worker. ${IDENTITY_HINT}`); return 0; }
+  const n = issueFromBranch(currentBranch(cwd));
+  if (!n) return 0; // not an issue branch → nothing to hold
+  const mf = markerFile(cwd);
+  const cur = mf && readMarker(mf);
+  const ttlMs = DEFAULT_TTL_MIN * 60_000;
+  if (cur && cur.issue === n && cur.owner === me && Date.now() - cur.at < ttlMs / 3) {
+    console.error(`🔒 holding issue #${n} as "${me}" (lease fresh; no network)`); return 0;
+  }
+  const r = renew(n, { owner: me }); // renew both creates and re-stamps; returns held if a live foreign lease exists
+  if (r.result === "renewed") { if (mf) writeMarker(mf, n, me); console.error(`🔒 holding issue #${n} as "${me}"`); return 0; }
+  if (r.result === "held") { console.error(`⚠ issue #${n} is leased by ${r.holder?.owner || "another agent"} — coordinate or switch issues.`); return 0; }
+  console.error("⚠ leasing unavailable (gh offline/unauthed) — proceeding WITHOUT a lease; watch for collisions."); return 0;
+}
+
+function cmdCodexHook(argv) {
+  const ev = codexEvent(argv);
+  return holdCurrentBranch(ev.cwd || process.cwd());
+}
+
 function cmdClaudeHook(argv) {
   const block = argv.includes("--block");
   let payload = {};
-  try { const raw = readFileSync(0, "utf8"); if (raw) payload = JSON.parse(raw); } catch { /* no/invalid stdin → best effort */ }
+  try { const raw = readFileSync(0, "utf8"); if (raw) payload = JSON.parse(raw); } catch { /* best effort */ }
   const event = payload.hook_event_name || "SessionStart";
   const cwd = payload.cwd || process.cwd();
-  const br = spawnSync("git", ["-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"], { encoding: "utf8" });
-  const branch = br.status === 0 ? br.stdout.trim() : "";
-  const n = issueFromBranch(branch);
-  if (!n) return 0; // not an issue branch → nothing to lease
-
-  const owner = process.env.AGENT_ID
-    || (payload.session_id ? `claude-${String(payload.session_id).slice(0, 8)}` : buildOwner());
-  const r = claim(n, { owner });
-  if (r.result === "degraded") return 0; // never block work on infra failure
+  const n = issueFromBranch(currentBranch(cwd));
+  const me = resolveOwner();
 
   const emit = (text) => {
     if (event === "SessionStart" || event === "UserPromptSubmit")
       process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: event, additionalContext: text } }));
   };
 
-  if (r.result === "held" && r.holder && r.holder.owner !== owner) {
-    const msg = `Issue #${n} is already leased by ${r.holder.owner}. Another agent is working it — coordinate or switch issues before editing.`;
-    if (event === "PreToolUse" && block) {
+  let situation = null;
+  if (me && n) {
+    const mf = markerFile(cwd);
+    if (event === "PreToolUse") {
+      // Hot path: trust a fresh self-held marker → allow with NO network call.
+      const c = mf && readMarker(mf);
+      if (c && c.issue === n && c.owner === me && Date.now() - c.at < (c.ttlMin || DEFAULT_TTL_MIN) * 60_000) {
+        situation = { result: "won" };
+      } else {
+        // Read-only ownership check (never create a lease on an edit). gh-offline → allow.
+        let holder = null;
+        try { holder = getHolder(n); } catch { holder = undefined; }
+        if (holder === undefined) situation = { result: "degraded" };
+        else if (holder && holder.owner === me) { situation = { result: "won" }; if (mf) writeMarker(mf, n, me); }
+        else if (holder) situation = { result: "held", holder };
+        else situation = { result: "won" }; // no lease exists → allow, but do NOT mark (we don't own it)
+      }
+    } else {
+      situation = claim(n, { owner: me });
+      if (situation.result === "won" && mf) writeMarker(mf, n, me);
+    }
+  }
+  const d = hookDecision({ me, n, block, claim: situation });
+
+  switch (d.kind) {
+    case "no-identity": {
+      const msg = `AGENT_ID is not set — issue-lease protection is DISABLED for this worker. ${IDENTITY_HINT}`;
+      console.error(`⚠ ${msg}`); emit(`⚠ ${msg}`); return 0;
+    }
+    case "deny": {
+      const msg = `Issue #${d.issue} is leased by ${d.holder}. Another agent is working it — coordinate or switch issues before editing.`;
       process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: msg } }));
       return 0;
     }
-    console.error(`⚠ ${msg}`);
-    emit(`⚠ ${msg}`);
-    return 0;
+    case "warn": {
+      const msg = `Issue #${d.issue} is already leased by ${d.holder}. Another agent is working it — coordinate or switch issues.`;
+      console.error(`⚠ ${msg}`); emit(`⚠ ${msg}`); return 0;
+    }
+    case "held": {
+      if (event !== "PreToolUse") {
+        const msg = `You hold the gh-issue-lease on issue #${d.issue} as "${d.owner}". Other agents are blocked from it.`;
+        console.error(`🔒 ${msg}`); emit(msg);
+      }
+      return 0;
+    }
+    default: return 0; // noop
   }
-
-  if (event !== "PreToolUse") {
-    const msg = `You hold the gh-issue-lease on issue #${n} as "${owner}". Other agents are blocked from it.`;
-    console.error(`🔒 ${msg}`);
-    emit(msg);
-  }
-  return 0;
 }
 
 function main(argv) {
   const [cmd, ...rest] = argv;
   const pos = rest.filter((a) => !a.startsWith("--"));
   switch (cmd) {
-    case "claude-hook": return cmdClaudeHook(rest);
     case "claim": {
-      warnOwnerFallback();
       const r = claim(pos[0], {});
       if (r.result === "won") { console.log("won"); return 0; }
       if (r.result === "degraded") { console.error("⚠ leasing unavailable (gh offline/unauthed) — proceed WITHOUT a lease."); console.log("degraded"); return 0; }
+      if (r.result === "no-identity") { console.error(`✗ AGENT_ID is not set — refusing to claim. ${IDENTITY_HINT}`); return 3; }
       console.error(`held by ${r.holder?.owner || "another agent"}`); return 1;
     }
-    case "renew": { warnOwnerFallback(); const r = renew(pos[0], {}); console.log(r.result); return r.result === "held" ? 1 : 0; }
+    case "renew": {
+      const r = renew(pos[0], {});
+      if (r.result === "no-identity") { console.error(`✗ AGENT_ID is not set. ${IDENTITY_HINT}`); return 3; }
+      console.log(r.result); return r.result === "held" ? 1 : 0;
+    }
     case "release": return release(pos[0]) ? (console.log("released"), 0) : (console.log("no lease to release"), 0);
     case "status": return cmdStatus(pos[0]);
     case "reap": return cmdReap();
     case "guard-push": {
-      // pre-push hook. Enforce that you hold the branch's issue lease. Non-issue
-      // branches and gh-offline both pass (never block legitimate work).
+      // pre-push gate. Read-only ownership check — never creates a lease. Non-issue
+      // branches and gh-offline pass (fail-open on infra); a lease held by someone
+      // else (or held while you have no AGENT_ID to prove it) blocks.
       const n = issueFromBranch(pos[0]);
       if (!n) return 0;
-      const me = buildOwner();
-      const r = claim(n, {});
-      if (r.result === "won" || r.result === "degraded") return 0;
-      if (r.holder && r.holder.owner === me) return 0;
-      console.error(`✗ push blocked: issue #${n} is leased by ${r.holder?.owner || "another agent"}.`);
-      console.error(`  Coordinate, pick another issue, or bypass with: git push --no-verify`);
+      const me = resolveOwner();
+      let holder = null;
+      try { holder = getHolder(n); } catch { return 0; } // gh unusable → don't block
+      const d = pushDecision({ me, holder });
+      if (d.allow) return 0;
+      console.error(`✗ push blocked: ${d.reason} (issue #${n}).`);
+      console.error(`  Set AGENT_ID / coordinate, or bypass with: git push --no-verify`);
       return 1;
     }
+    case "hook": return holdCurrentBranch(process.cwd());
+    case "codex-hook": return cmdCodexHook(rest);
+    case "claude-hook": return cmdClaudeHook(rest);
     default:
-      console.error("gh-issue-lease commands: claim <N> | release <N> | renew <N> | status [<N>] | reap | guard-push <branch> | claude-hook [--block]");
+      console.error("gh-issue-lease: claim <N> | release <N> | renew <N> | status [<N>] | reap | guard-push <branch> | hook | codex-hook | claude-hook [--block]");
       return 2;
   }
 }
 
-// Run the CLI when invoked directly. npm/pnpm install this bin as a SYMLINK
-// (node_modules/.bin/gh-issue-lease → src/issue-lease.mjs), so a naive
-// argv[1]-vs-import.meta.url compare fails and the CLI silently no-ops. Resolve
-// symlinks on both sides so the installed bin actually runs.
+// Run the CLI when invoked directly. npm/pnpm install the bin as a SYMLINK, so a
+// naive argv[1]-vs-import.meta.url compare fails and the CLI silently no-ops.
 function isCliEntry() {
   if (!process.argv[1]) return false;
   try { return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url)); }
