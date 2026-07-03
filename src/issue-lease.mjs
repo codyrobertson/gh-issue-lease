@@ -31,7 +31,7 @@
 
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { realpathSync } from "node:fs";
+import { realpathSync, readFileSync } from "node:fs";
 
 const DEFAULT_TTL_MIN = Number(process.env.AGENT_LEASE_TTL_MIN) || 240;
 const NAMESPACE = (process.env.ISSUE_LEASE_NAMESPACE || "leases").replace(/^\/+|\/+$/g, "");
@@ -277,10 +277,57 @@ function cmdReap() {
   return 0;
 }
 
+// claude-hook — a Claude Code hook entrypoint. Reads Claude's hook JSON on stdin,
+// derives the current branch's issue, and claims it automatically — so a Claude
+// agent leases its issue without ever thinking about locks. Owner defaults to the
+// Claude session id, so concurrent sessions are distinct and attributable.
+//   SessionStart / UserPromptSubmit : inject a context line (won or held-by-other).
+//   PreToolUse with --block         : DENY the edit if another agent holds the lease.
+function cmdClaudeHook(argv) {
+  const block = argv.includes("--block");
+  let payload = {};
+  try { const raw = readFileSync(0, "utf8"); if (raw) payload = JSON.parse(raw); } catch { /* no/invalid stdin → best effort */ }
+  const event = payload.hook_event_name || "SessionStart";
+  const cwd = payload.cwd || process.cwd();
+  const br = spawnSync("git", ["-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"], { encoding: "utf8" });
+  const branch = br.status === 0 ? br.stdout.trim() : "";
+  const n = issueFromBranch(branch);
+  if (!n) return 0; // not an issue branch → nothing to lease
+
+  const owner = process.env.AGENT_ID
+    || (payload.session_id ? `claude-${String(payload.session_id).slice(0, 8)}` : buildOwner());
+  const r = claim(n, { owner });
+  if (r.result === "degraded") return 0; // never block work on infra failure
+
+  const emit = (text) => {
+    if (event === "SessionStart" || event === "UserPromptSubmit")
+      process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: event, additionalContext: text } }));
+  };
+
+  if (r.result === "held" && r.holder && r.holder.owner !== owner) {
+    const msg = `Issue #${n} is already leased by ${r.holder.owner}. Another agent is working it — coordinate or switch issues before editing.`;
+    if (event === "PreToolUse" && block) {
+      process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: msg } }));
+      return 0;
+    }
+    console.error(`⚠ ${msg}`);
+    emit(`⚠ ${msg}`);
+    return 0;
+  }
+
+  if (event !== "PreToolUse") {
+    const msg = `You hold the gh-issue-lease on issue #${n} as "${owner}". Other agents are blocked from it.`;
+    console.error(`🔒 ${msg}`);
+    emit(msg);
+  }
+  return 0;
+}
+
 function main(argv) {
   const [cmd, ...rest] = argv;
   const pos = rest.filter((a) => !a.startsWith("--"));
   switch (cmd) {
+    case "claude-hook": return cmdClaudeHook(rest);
     case "claim": {
       warnOwnerFallback();
       const r = claim(pos[0], {});
@@ -306,7 +353,7 @@ function main(argv) {
       return 1;
     }
     default:
-      console.error("gh-issue-lease commands: claim <N> | release <N> | renew <N> | status [<N>] | reap | guard-push <branch>");
+      console.error("gh-issue-lease commands: claim <N> | release <N> | renew <N> | status [<N>] | reap | guard-push <branch> | claude-hook [--block]");
       return 2;
   }
 }

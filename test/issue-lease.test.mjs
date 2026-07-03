@@ -78,6 +78,14 @@ test("CLI runs when invoked through a symlinked bin (npm/pnpm install shape)", (
   }
 });
 
+test("claude-hook is a silent no-op on a non-issue branch (no stdout, exit 0)", () => {
+  // The package's own repo is on a non-issue branch, so issueFromBranch → null.
+  const payload = JSON.stringify({ hook_event_name: "SessionStart", cwd: dirname(SRC), session_id: "abcd1234ef" });
+  const r = spawnSync(process.execPath, [SRC, "claude-hook"], { input: payload, encoding: "utf8" });
+  assert.equal(r.status, 0);
+  assert.equal(r.stdout, "", "no context injected when there is no issue branch");
+});
+
 test("issueFromBranch extracts the number the pre-push hook gates on", () => {
   assert.equal(issueFromBranch("fix/1069-print-qr"), 1069);
   assert.equal(issueFromBranch("feat/1109-owner-recency"), 1109);

@@ -1,6 +1,6 @@
 {
   "name": "gh-issue-lease",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Atomic, GitHub-native mutex for multi-agent work. The lock IS a git ref — no server, no database. First writer wins.",
   "type": "module",
   "bin": {
