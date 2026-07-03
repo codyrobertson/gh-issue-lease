@@ -37,8 +37,8 @@
 
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { realpathSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { realpathSync, readFileSync, writeFileSync, statSync } from "node:fs";
+import { join, dirname, resolve, isAbsolute } from "node:path";
 
 const DEFAULT_TTL_MIN = Number(process.env.AGENT_LEASE_TTL_MIN) || 240;
 const NAMESPACE = (process.env.ISSUE_LEASE_NAMESPACE || "leases").replace(/^\/+|\/+$/g, "");
@@ -274,17 +274,55 @@ function cmdReap() {
 // child sub-agents share the worktree → share this file, so after SessionStart the
 // per-edit PreToolUse check is a local file read (~0 network) instead of a GitHub
 // round-trip. Trusted only within the lease TTL, so it can never outlive the lease.
-function markerFile(cwd) {
-  const r = spawnSync("git", ["-C", cwd, "rev-parse", "--absolute-git-dir"], { encoding: "utf8" });
-  return r.status === 0 && r.stdout.trim() ? join(r.stdout.trim(), "gh-issue-lease-hold.json") : null;
+const MARKER = "gh-issue-lease-hold.json";
+
+// PURE: `.git/HEAD` is `ref: refs/heads/<branch>` on a branch, or a raw sha when
+// detached. Detached → "" (no issue branch → nothing to gate).
+export function parseHeadRef(text) {
+  const m = String(text).trim().match(/^ref:\s*refs\/heads\/(.+)$/);
+  return m ? m[1].trim() : "";
 }
+// PURE: a linked-worktree/submodule `.git` is a FILE `gitdir: <path>`.
+export function parseDotGitFile(text) {
+  const m = String(text).match(/gitdir:\s*(.+)/);
+  return m ? m[1].trim() : null;
+}
+
+// Resolve the branch + the worktree's git dir WITHOUT spawning git — on the per-edit
+// hot path this replaces a ~5-10ms fork/exec with ~0.2ms of file reads, so the check
+// is bounded only by Node's own startup. Walks up for `.git` (dir OR worktree/submodule
+// file), then reads HEAD. Falls back to `git rev-parse` for anything exotic.
+function gitContext(cwd) {
+  let dir = cwd;
+  for (;;) {
+    const dotgit = join(dir, ".git");
+    let st = null; try { st = statSync(dotgit); } catch { st = null; }
+    if (st) {
+      let gitDir;
+      if (st.isDirectory()) gitDir = dotgit;
+      else {
+        let ptr = null; try { ptr = parseDotGitFile(readFileSync(dotgit, "utf8")); } catch { ptr = null; }
+        if (!ptr) return gitFallback(cwd);
+        gitDir = isAbsolute(ptr) ? ptr : resolve(dir, ptr);
+      }
+      let head = ""; try { head = readFileSync(join(gitDir, "HEAD"), "utf8"); } catch { return gitFallback(cwd); }
+      return { branch: parseHeadRef(head), gitDir };
+    }
+    const parent = dirname(dir);
+    if (parent === dir) return gitFallback(cwd); // reached fs root, no repo → let git decide (GIT_DIR env, etc.)
+    dir = parent;
+  }
+}
+function gitFallback(cwd) {
+  const r = spawnSync("git", ["-C", cwd, "rev-parse", "--abbrev-ref", "HEAD", "--absolute-git-dir"], { encoding: "utf8" });
+  if (r.status !== 0) return { branch: "", gitDir: null };
+  const lines = r.stdout.trim().split("\n");
+  return { branch: (lines[0] || "").trim(), gitDir: (lines[1] || "").trim() || null };
+}
+function markerPath(gitDir) { return gitDir ? join(gitDir, MARKER) : null; }
 function readMarker(file) { try { return JSON.parse(readFileSync(file, "utf8")); } catch { return null; } }
 function writeMarker(file, issue, owner) {
   try { writeFileSync(file, JSON.stringify({ issue, owner, ttlMin: DEFAULT_TTL_MIN, at: Date.now() })); } catch { /* best effort */ }
-}
-function currentBranch(cwd) {
-  const br = spawnSync("git", ["-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"], { encoding: "utf8" });
-  return br.status === 0 ? br.stdout.trim() : "";
 }
 
 // PURE: Codex's `notify` passes a single JSON string as an argv. We only need it to
@@ -304,9 +342,10 @@ export function codexEvent(argv) {
 function holdCurrentBranch(cwd) {
   const me = resolveOwner();
   if (!me) { console.error(`⚠ AGENT_ID is not set — issue-lease protection is DISABLED for this worker. ${IDENTITY_HINT}`); return 0; }
-  const n = issueFromBranch(currentBranch(cwd));
+  const { branch, gitDir } = gitContext(cwd);
+  const n = issueFromBranch(branch);
   if (!n) return 0; // not an issue branch → nothing to hold
-  const mf = markerFile(cwd);
+  const mf = markerPath(gitDir);
   const cur = mf && readMarker(mf);
   const ttlMs = DEFAULT_TTL_MIN * 60_000;
   if (cur && cur.issue === n && cur.owner === me && Date.now() - cur.at < ttlMs / 3) {
@@ -329,7 +368,8 @@ function cmdClaudeHook(argv) {
   try { const raw = readFileSync(0, "utf8"); if (raw) payload = JSON.parse(raw); } catch { /* best effort */ }
   const event = payload.hook_event_name || "SessionStart";
   const cwd = payload.cwd || process.cwd();
-  const n = issueFromBranch(currentBranch(cwd));
+  const { branch, gitDir } = gitContext(cwd);
+  const n = issueFromBranch(branch);
   const me = resolveOwner();
 
   const emit = (text) => {
@@ -339,7 +379,7 @@ function cmdClaudeHook(argv) {
 
   let situation = null;
   if (me && n) {
-    const mf = markerFile(cwd);
+    const mf = markerPath(gitDir);
     if (event === "PreToolUse") {
       // Hot path: trust a fresh self-held marker → allow with NO network call.
       const c = mf && readMarker(mf);

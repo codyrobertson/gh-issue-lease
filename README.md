@@ -100,7 +100,7 @@ Non-issue branches pass; `gh` offline passes; bypass once with `git push --no-ve
 }
 ```
 
-`SessionStart` claims the branch's issue and drops a per-worktree marker; `PreToolUse` reads that marker and allows with **zero network calls** on the hot path (owner editing its own issue) — only a foreign issue does a network check.
+`SessionStart` claims the branch's issue and drops a per-worktree marker; `PreToolUse` reads that marker and allows with **zero network calls and zero subprocesses** on the hot path (owner editing its own issue) — branch + git-dir come from reading `.git/HEAD` directly, so the per-edit check is **~37 ms, within ~3 ms of Node's own cold-start floor** (a foreign issue falls back to one network check). That 34 ms of Node startup is the physical wall for a pure-npm CLI; going lower means a native binary or a resident daemon.
 
 **Codex** — its `notify` fires *after* a turn, so it **cannot block** (that's a Codex limitation, not ours; the pre-push hook is the teeth for Codex). It's still useful as an auto-claim + heartbeat so a long session never lets its lease lapse. In `~/.codex/config.toml`:
 

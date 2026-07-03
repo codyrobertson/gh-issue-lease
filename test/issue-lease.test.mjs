@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import {
   refShort, refFull, resolveOwner, parseLeaseMessage, isExpired,
   normalizeIssue, backoffMs, issueFromBranch, pushDecision, hookDecision, codexEvent,
+  parseHeadRef, parseDotGitFile,
 } from "../src/issue-lease.mjs";
 
 const SRC = resolve(dirname(fileURLToPath(import.meta.url)), "../src/issue-lease.mjs");
@@ -78,6 +79,21 @@ test("issueFromBranch extracts issue #, null for non-issue branches", () => {
   assert.equal(issueFromBranch("chore/worktree-gc"), null);
   assert.equal(issueFromBranch("release/v2"), null);            // a number that isn't an issue id
   assert.equal(issueFromBranch("master"), null);
+});
+
+// ---------- git-free branch/gitdir resolution, pure ----------
+
+test("parseHeadRef reads the branch from HEAD, '' when detached", () => {
+  assert.equal(parseHeadRef("ref: refs/heads/fix/990002-print-qr\n"), "fix/990002-print-qr");
+  assert.equal(parseHeadRef("ref: refs/heads/main"), "main");
+  assert.equal(parseHeadRef("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"), ""); // detached sha
+  assert.equal(parseHeadRef(""), "");
+});
+
+test("parseDotGitFile extracts the worktree/submodule gitdir pointer", () => {
+  assert.equal(parseDotGitFile("gitdir: /repo/.git/worktrees/foo\n"), "/repo/.git/worktrees/foo");
+  assert.equal(parseDotGitFile("gitdir: ../.git/modules/sub"), "../.git/modules/sub");
+  assert.equal(parseDotGitFile("not a gitdir file"), null);
 });
 
 // ---------- codexEvent: Codex `notify` argv parsing, pure ----------
