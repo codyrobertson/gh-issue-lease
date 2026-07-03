@@ -1,9 +1,16 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, symlinkSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   refShort, refFull, buildOwner, parseLeaseMessage, isExpired,
   normalizeIssue, backoffMs, issueFromBranch,
 } from "../src/issue-lease.mjs";
+
+const SRC = resolve(dirname(fileURLToPath(import.meta.url)), "../src/issue-lease.mjs");
 
 test("ref names map to the issue number", () => {
   assert.equal(refShort(123), "leases/issue-123");
@@ -53,6 +60,22 @@ test("backoff grows, stays within [base/2, base] and is jittered", () => {
   assert.ok(lo >= (Math.min(1000 * 2 ** 3, 30000) / 2) - 1);
   assert.ok(hi <= Math.min(1000 * 2 ** 3, 30000) + 1);
   assert.ok(backoffMs(10, () => 1) <= 30000, "capped at 30s");
+});
+
+test("CLI runs when invoked through a symlinked bin (npm/pnpm install shape)", () => {
+  // Regression: npm installs the bin as node_modules/.bin/gh-issue-lease → src.
+  // A naive argv[1]-vs-import.meta.url check fails there and the CLI silently
+  // no-ops (guard-push/status/reap would do nothing). Assert the symlink runs.
+  const dir = mkdtempSync(join(tmpdir(), "ghil-"));
+  try {
+    const link = join(dir, "gh-issue-lease");
+    symlinkSync(SRC, link);
+    const r = spawnSync(process.execPath, [link], { encoding: "utf8" });
+    assert.equal(r.status, 2, "usage exit code");
+    assert.match(r.stderr, /guard-push/, "prints command list");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("issueFromBranch extracts the number the pre-push hook gates on", () => {

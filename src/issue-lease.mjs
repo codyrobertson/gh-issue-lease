@@ -30,7 +30,8 @@
 //      GH_ISSUE_LEASE_MAX_RETRY (backoff attempts on rate-limit/5xx, default 5).
 
 import { spawnSync } from "node:child_process";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
+import { realpathSync } from "node:fs";
 
 const DEFAULT_TTL_MIN = Number(process.env.AGENT_LEASE_TTL_MIN) || 240;
 const NAMESPACE = (process.env.ISSUE_LEASE_NAMESPACE || "leases").replace(/^\/+|\/+$/g, "");
@@ -310,7 +311,17 @@ function main(argv) {
   }
 }
 
-if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
+// Run the CLI when invoked directly. npm/pnpm install this bin as a SYMLINK
+// (node_modules/.bin/gh-issue-lease → src/issue-lease.mjs), so a naive
+// argv[1]-vs-import.meta.url compare fails and the CLI silently no-ops. Resolve
+// symlinks on both sides so the installed bin actually runs.
+function isCliEntry() {
+  if (!process.argv[1]) return false;
+  try { return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url)); }
+  catch { return false; }
+}
+
+if (isCliEntry()) {
   try { process.exit(main(process.argv.slice(2))); }
   catch (err) { console.error(`gh-issue-lease: ${err.message}`); process.exit(1); }
 }
