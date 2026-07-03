@@ -4,16 +4,18 @@
   "description": "Atomic, GitHub-native mutex for multi-agent work. The lock IS a git ref — no server, no database. First writer wins.",
   "type": "module",
   "bin": {
-    "gh-issue-lease": "src/issue-lease.mjs"
+    "gh-issue-lease": "dist/issue-lease.mjs"
   },
   "exports": {
-    ".": "./src/issue-lease.mjs"
+    ".": "./dist/issue-lease.mjs"
   },
   "files": [
-    "src/issue-lease.mjs",
+    "dist/issue-lease.mjs",
     "hooks/pre-push"
   ],
   "scripts": {
+    "build": "esbuild src/issue-lease.mjs --minify --format=esm --platform=node --legal-comments=none --outfile=dist/issue-lease.mjs && chmod +x dist/issue-lease.mjs",
+    "prepack": "npm run build",
     "test": "node --test"
   },
   "engines": {
@@ -41,5 +43,8 @@
   },
   "homepage": "https://github.com/codyrobertson/gh-issue-lease#readme",
   "author": "Mackenzie Robertson <digitalcody@gmail.com>",
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "esbuild": "^0.28.1"
+  }
 }

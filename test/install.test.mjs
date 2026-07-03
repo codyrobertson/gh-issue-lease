@@ -42,12 +42,12 @@ function installTarball() {
   // npm links bins under node_modules/.bin as relative symlinks — reproduce that.
   const binDir = join(nm, ".bin");
   mkdirSync(binDir, { recursive: true });
-  symlinkSync(join("..", "gh-issue-lease", "src", "issue-lease.mjs"), join(binDir, "gh-issue-lease"));
+  symlinkSync(join("..", "gh-issue-lease", "dist", "issue-lease.mjs"), join(binDir, "gh-issue-lease"));
   return { root, pkgDir, bin: join(binDir, "gh-issue-lease") };
 }
 
 test("the tarball ships exactly what's needed and nothing stray", { skip }, () => {
-  for (const need of ["package.json", "src/issue-lease.mjs", "hooks/pre-push", "README.md", "LICENSE"])
+  for (const need of ["package.json", "dist/issue-lease.mjs", "hooks/pre-push", "README.md", "LICENSE"])
     assert.ok(FILES.includes(need), `published tarball is missing ${need} (files: ${FILES.join(", ")})`);
   // no secrets / dev cruft leaked into the package
   for (const f of FILES)
@@ -102,7 +102,7 @@ test("the shipped pre-push hook resolves the CLI and passes non-issue branches",
     const binDir = join(root, "shim");
     mkdirSync(binDir);
     const shim = join(binDir, "gh-issue-lease");
-    writeFileSync(shim, `#!/bin/sh\nexec "${process.execPath}" "${join(pkgDir, "src", "issue-lease.mjs")}" "$@"\n`);
+    writeFileSync(shim, `#!/bin/sh\nexec "${process.execPath}" "${join(pkgDir, "dist", "issue-lease.mjs")}" "$@"\n`);
     chmodSync(shim, 0o755);
 
     // Feed the hook a push line for a NON-issue branch → guard-push returns 0 (hermetic, no network).
@@ -121,7 +121,7 @@ test("nested-install layout: bin still resolves when packaged deep", { skip }, (
   try {
     const deep = mkdtempSync(join(tmpdir(), "ghil-deep-"));
     const link = join(deep, "gh-issue-lease");
-    symlinkSync(join(pkgDir, "src", "issue-lease.mjs"), link);
+    symlinkSync(join(pkgDir, "dist", "issue-lease.mjs"), link);
     const r = spawnSync(process.execPath, [link, "status", "--help"], { encoding: "utf8", env: { ...process.env, AGENT_ID: "" } });
     // `status` with no network would try gh; but we only assert the CLI dispatched
     // (didn't silently no-op) — any exit is fine as long as it's not the "no entry" void.
