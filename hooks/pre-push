@@ -1,0 +1,30 @@
+#!/bin/sh
+set -eu
+#
+# gh-issue-lease pre-push hook — agent-agnostic issue-lease enforcement.
+#
+# ANY pusher (Claude, Codex, or a human) of a branch named `<type>/<N>-<slug>` or
+# `issue-<N>-...` must hold the lease `refs/leases/issue-<N>`. If someone else holds
+# a LIVE lease, the push is rejected. Non-issue branches are ignored; gh-offline
+# never blocks legitimate work.
+#
+# Install:  git config core.hooksPath .githooks   (and copy this file there)
+# Disable:  git config issueLease.enforce false
+# Bypass once: git push --no-verify
+
+[ "$(git config --bool issueLease.enforce 2>/dev/null || echo true)" = "true" ] || exit 0
+
+# Resolve the CLI: prefer a locally installed binary, fall back to npx.
+LEASE="gh-issue-lease"
+command -v "$LEASE" >/dev/null 2>&1 || LEASE="npx --no-install gh-issue-lease"
+
+# refs arrive on stdin: <local ref> <local sha> <remote ref> <remote sha>
+while read -r localref _localsha _remoteref _remotesha; do
+  case "$localref" in
+    refs/heads/*) branch="${localref#refs/heads/}" ;;
+    *) continue ;;
+  esac
+  $LEASE guard-push "$branch" || exit 1
+done
+
+exit 0

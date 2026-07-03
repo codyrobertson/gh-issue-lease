@@ -1,0 +1,45 @@
+{
+  "name": "gh-issue-lease",
+  "version": "0.1.0",
+  "description": "Atomic, GitHub-native mutex for multi-agent work. The lock IS a git ref — no server, no database. First writer wins.",
+  "type": "module",
+  "bin": {
+    "gh-issue-lease": "src/issue-lease.mjs"
+  },
+  "exports": {
+    ".": "./src/issue-lease.mjs"
+  },
+  "files": [
+    "src/issue-lease.mjs",
+    "hooks/pre-push"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "lock",
+    "mutex",
+    "lease",
+    "github",
+    "git",
+    "agents",
+    "multi-agent",
+    "coordination",
+    "distributed-lock",
+    "gh",
+    "issues"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/codyrobertson/gh-issue-lease.git"
+  },
+  "bugs": {
+    "url": "https://github.com/codyrobertson/gh-issue-lease/issues"
+  },
+  "homepage": "https://github.com/codyrobertson/gh-issue-lease#readme",
+  "author": "Mackenzie Robertson <digitalcody@gmail.com>",
+  "license": "MIT"
+}
