@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import {
   refShort, refFull, resolveOwner, parseLeaseMessage, isExpired,
   normalizeIssue, backoffMs, issueFromBranch, pushDecision, hookDecision, codexEvent,
-  parseHeadRef, parseDotGitFile,
+  parseHeadRef, parseDotGitFile, parseBlockers, nextWalk, isTransient, retryAfterMs,
 } from "../src/issue-lease.mjs";
 
 const SRC = resolve(dirname(fileURLToPath(import.meta.url)), "../src/issue-lease.mjs");
@@ -154,6 +154,174 @@ test("hookDecision: another agent holds it → deny when blocking, warn otherwis
   assert.equal(hookDecision({ me: "a", n: 5, block: false, claim: held }).kind, "warn");
 });
 
+// ---------- rate-limit classification, pure ----------
+
+test("isTransient catches secondary rate limits, 429, and Retry-After (not business errors)", () => {
+  assert.ok(isTransient("You have exceeded a secondary rate limit and have triggered abuse detection"));
+  assert.ok(isTransient("HTTP 429 Too Many Requests"));
+  assert.ok(isTransient("Retry-After: 60"));
+  assert.ok(isTransient("API rate limit exceeded"));
+  assert.ok(isTransient("HTTP 502 Bad Gateway"));
+  assert.equal(isTransient("Reference already exists"), false);
+  assert.equal(isTransient("HTTP 404 Not Found"), false);
+});
+
+test("retryAfterMs honors GitHub's Retry-After (bounded), null when absent", () => {
+  assert.equal(retryAfterMs("Retry-After: 30"), 30_000);
+  assert.equal(retryAfterMs("retry after 5 seconds"), 5_000);
+  assert.equal(retryAfterMs("Retry-After: 9999", 30_000), 30_000); // capped
+  assert.equal(retryAfterMs("no header here"), null);
+});
+
+// ---------- parseBlockers: the dependency scanner, pure ----------
+
+test("parseBlockers matches all 5 patterns, case-insensitive", () => {
+  assert.deepEqual(parseBlockers("blocked by #1"), [1]);
+  assert.deepEqual(parseBlockers("Blocked-by #2"), [2]);
+  assert.deepEqual(parseBlockers("depends on #3"), [3]);
+  assert.deepEqual(parseBlockers("Depends-On #4"), [4]);
+  assert.deepEqual(parseBlockers("- [ ] #5"), [5]);
+});
+
+test("parseBlockers excludes CHECKED task items, keeps unchecked", () => {
+  assert.deepEqual(parseBlockers("- [x] #10\n- [ ] #11"), [11]);
+  assert.deepEqual(parseBlockers("- [X] #12"), []);        // capital X still checked
+  assert.deepEqual(parseBlockers("* [ ] blocks on #13"), [13]); // `*` bullet + text before #
+});
+
+test("parseBlockers de-dupes and combines patterns across a body", () => {
+  const body = "Depends on #7.\nblocked by #7\n- [ ] #8\n- [x] #9\ntext #999 not a blocker";
+  assert.deepEqual(parseBlockers(body), [7, 8]);           // #7 once, #9 checked-out, #999 ignored
+});
+
+test("parseBlockers returns [] for empty/nullish body", () => {
+  assert.deepEqual(parseBlockers(""), []);
+  assert.deepEqual(parseBlockers(null), []);
+  assert.deepEqual(parseBlockers(undefined), []);
+});
+
+// ---------- nextWalk: injectable core of the `next` verb, pure (no network) ----------
+
+const listOf = (...nums) => () => nums.map((n) => ({ number: n, body: "" }));
+
+test("nextWalk returns the first winnable issue number", () => {
+  const r = nextWalk({ listIssues: listOf(10, 11, 12), claimFn: () => ({ result: "won" }) });
+  assert.deepEqual(r, { kind: "won", number: 10 });
+});
+
+test("nextWalk skips contended issues and wins the first free one", () => {
+  const held = new Set([10, 11]);
+  const claimFn = (n) => (held.has(n) ? { result: "held" } : { result: "won" });
+  const r = nextWalk({ listIssues: listOf(10, 11, 12), claimFn });
+  assert.deepEqual(r, { kind: "won", number: 12 });
+});
+
+test("nextWalk --skip-blocked skips a candidate whose blocker is open", () => {
+  const listIssues = () => [
+    { number: 20, body: "blocked by #99" }, // #99 open ⇒ skip
+    { number: 21, body: "depends on #98" }, // #98 closed ⇒ eligible
+  ];
+  const isBlockerOpen = (b) => b === 99; // 99 open, 98 closed
+  const claimFn = () => ({ result: "won" });
+  const r = nextWalk({ listIssues, claimFn, isBlockerOpen, skipBlocked: true });
+  assert.deepEqual(r, { kind: "won", number: 21 });
+});
+
+test("nextWalk without skipBlocked ignores blockers entirely", () => {
+  const listIssues = () => [{ number: 30, body: "blocked by #99" }];
+  const isBlockerOpen = () => { throw new Error("must not be consulted"); };
+  const r = nextWalk({ listIssues, claimFn: () => ({ result: "won" }), isBlockerOpen, skipBlocked: false });
+  assert.deepEqual(r, { kind: "won", number: 30 });
+});
+
+test("nextWalk drained queue (all held) → empty sentinel", () => {
+  const r = nextWalk({ listIssues: listOf(1, 2, 3), claimFn: () => ({ result: "held" }) });
+  assert.deepEqual(r, { kind: "empty" });
+});
+
+test("nextWalk empty list → empty sentinel", () => {
+  const r = nextWalk({ listIssues: () => [], claimFn: () => ({ result: "won" }) });
+  assert.deepEqual(r, { kind: "empty" });
+});
+
+test("nextWalk propagates degraded issue-lister (proceed unlocked)", () => {
+  const r = nextWalk({ listIssues: () => ({ degraded: true }), claimFn: () => ({ result: "won" }) });
+  assert.deepEqual(r, { kind: "degraded" });
+});
+
+test("nextWalk surfaces no-identity from the claimer (fail closed)", () => {
+  const r = nextWalk({ listIssues: listOf(5), claimFn: () => ({ result: "no-identity" }) });
+  assert.deepEqual(r, { kind: "no-identity" });
+});
+
+test("nextWalk treats an all-degraded claim run as degraded (gh genuinely down)", () => {
+  // every pass re-lists the same issue, every claim is transient → degraded, not empty
+  const r = nextWalk({ listIssues: listOf(5), claimFn: () => ({ result: "degraded" }), sleep: () => {} });
+  assert.deepEqual(r, { kind: "degraded" });
+});
+
+// ---------- liveness: a transient on one issue must not abandon a free one ----------
+
+test("nextWalk SOFT-skips a transient candidate and wins a LATER one in the SAME pass", () => {
+  // issue 20 hits a rate-limit (degraded); 21 is free → keep walking, win 21. NOT degraded.
+  const claimFn = (n) => (n === 20 ? { result: "degraded" } : { result: "won" });
+  const r = nextWalk({ listIssues: listOf(20, 21), claimFn, sleep: () => {} });
+  assert.deepEqual(r, { kind: "won", number: 21 });
+});
+
+test("nextWalk retries across passes: transient on pass 1, won on pass 2", () => {
+  let calls = 0;
+  const claimFn = (n) => (n === 30 && calls++ === 0 ? { result: "degraded" } : { result: "won" });
+  let listed = 0;
+  const listIssues = () => { listed++; return [{ number: 30, body: "" }]; };
+  const r = nextWalk({ listIssues, claimFn, sleep: () => {} });
+  assert.deepEqual(r, { kind: "won", number: 30 });
+  assert.ok(listed >= 2, `expected a re-list on pass 2, saw ${listed} list calls`);
+});
+
+test("nextWalk exit-10 (drained) requires a FULL pass of definitive holds, zero transients", () => {
+  const r = nextWalk({ listIssues: listOf(1, 2, 3), claimFn: () => ({ result: "held" }), sleep: () => {} });
+  assert.deepEqual(r, { kind: "empty" });
+});
+
+test("nextWalk does NOT exit-10 when a transient masked a candidate (retries, then degraded)", () => {
+  // one held + one always-transient, over all passes → never a clean full pass → degraded, never empty
+  const claimFn = (n) => (n === 41 ? { result: "held" } : { result: "degraded" });
+  const r = nextWalk({ listIssues: listOf(40, 41), claimFn, maxPasses: 3, sleep: () => {} });
+  assert.deepEqual(r, { kind: "degraded" });
+});
+
+// ---------- index lag: eventual consistency of the label-filtered list ----------
+
+test("nextWalk CONFIRMS before draining: empty list, then the issue appears → CLAIMS it", () => {
+  // GitHub index lag: the freshly-created issue is invisible on the first read(s).
+  let call = 0;
+  const listIssues = () => (call++ < 2 ? [] : [{ number: 70, body: "" }]);
+  const r = nextWalk({ listIssues, claimFn: () => ({ result: "won" }), sleep: () => {} });
+  assert.deepEqual(r, { kind: "won", number: 70 }, "must not exit-10 on a lagging empty read");
+});
+
+test("nextWalk CONFIRMS before draining: subset of held, re-list reveals free issues → claims one", () => {
+  // pass 1 sees 4 candidates all held; the confirm re-list reveals 2 more that are free.
+  let call = 0;
+  const listIssues = () =>
+    call++ === 0
+      ? [1, 2, 3, 4].map((n) => ({ number: n, body: "" }))
+      : [1, 2, 3, 4, 5, 6].map((n) => ({ number: n, body: "" }));
+  const held = new Set([1, 2, 3, 4]);
+  const claimFn = (n) => (held.has(n) ? { result: "held" } : { result: "won" });
+  const r = nextWalk({ listIssues, claimFn, sleep: () => {} });
+  assert.deepEqual(r, { kind: "won", number: 5 }, "must reconsider newly-indexed candidates, not drain");
+});
+
+test("nextWalk still reaches exit-10 for a genuinely-empty backlog (after the confirm)", () => {
+  let calls = 0;
+  const listIssues = () => { calls++; return []; };
+  const r = nextWalk({ listIssues, claimFn: () => ({ result: "won" }), sleep: () => {} });
+  assert.deepEqual(r, { kind: "empty" });
+  assert.ok(calls >= 2, `exit-10 must require ≥1 confirming re-list, saw ${calls} reads`);
+});
+
 // ---------- CLI wiring ----------
 
 test("CLI runs through a symlinked bin (npm/pnpm install shape)", () => {
@@ -164,6 +332,8 @@ test("CLI runs through a symlinked bin (npm/pnpm install shape)", () => {
     const r = spawnSync(process.execPath, [link], { encoding: "utf8" });
     assert.equal(r.status, 2);
     assert.match(r.stderr, /guard-push/);
+    assert.match(r.stderr, /\bnext\b/);
+    assert.match(r.stderr, /\bmine\b/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

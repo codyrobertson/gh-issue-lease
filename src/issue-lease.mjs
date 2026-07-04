@@ -18,6 +18,9 @@
 //
 // Commands:
 //   claim <N>     0 won · 1 held · 3 no AGENT_ID · (degraded→0, proceed unlocked)
+//   next [flags]  atomically pop the next unclaimed open issue (0 won/degraded · 3 no
+//                 AGENT_ID · 10 queue drained); prints the bare issue number to stdout
+//   mine          the issues I currently hold (owner === my AGENT_ID)
 //   release <N>   drop the lease
 //   renew <N>     re-stamp your lease clock (heartbeat for long tasks)
 //   status [<N>]  who holds what
@@ -115,14 +118,101 @@ export function hookDecision({ me, n, block, claim }) {
   return { kind: "held", issue: n, owner: me };
 }
 
+// PURE: scan an issue body for blocker references, returning de-duped issue numbers.
+// Matches (case-insensitive): `blocked by #N`, `blocked-by #N`, `depends on #N`,
+// `depends-on #N`, and UNCHECKED GitHub task-list lines `- [ ] … #N` (a checked
+// `- [x] #N` is deliberately NOT a blocker). Total & network-free: empty/nullish → [].
+export function parseBlockers(body) {
+  if (!body) return [];
+  const text = String(body);
+  const nums = new Set();
+  const phrase = /(?:blocked[ -]by|depends[ -]on)\s*:?\s*#(\d+)/gi;
+  for (let m; (m = phrase.exec(text)); ) nums.add(Number(m[1]));
+  for (const line of text.split(/\r?\n/)) {
+    const box = line.match(/^\s*[-*]\s*\[ \]/); // literal space ⇒ unchecked only
+    if (!box) continue;
+    const rest = line.slice(box[0].length);
+    for (let m, re = /#(\d+)/g; (m = re.exec(rest)); ) nums.add(Number(m[1]));
+  }
+  return [...nums];
+}
+
+// PURE, injectable core of the `next` verb — no network. Walks candidates in order,
+// optionally skipping any with an OPEN blocker, and attempts to claim each via the
+// injected `claimFn` (the real one is `claim`). Returns a result kind:
+//   degraded    — the queue is genuinely unreachable (proceed unlocked)
+//   no-identity — a claim reported AGENT_ID is unset (fail closed)
+//   won         — first winnable candidate (carries its number)
+//   empty       — a FULL pass found every candidate definitively held (queue drained)
+// `listIssues()` → array of {number, body, …} OR a {degraded:true} sentinel.
+// `isBlockerOpen(n)` → boolean (only consulted when skipBlocked).
+//
+// LIVENESS has TWO failure modes, both handled here:
+//  1. Transient (`degraded` from claimFn) — a rate-limit on issue A must not abandon a
+//     still-free issue B. So a `degraded` claim is a SOFT-skip: keep walking the pass,
+//     and if the pass wins nothing while any transient was seen, re-list + retry (backoff).
+//  2. INDEX LAG — GitHub's label-filtered issue list is EVENTUALLY CONSISTENT: a freshly
+//     created issue takes ~5s to appear, so a single read can return `[]` (or a subset)
+//     that is indistinguishable from a genuinely drained backlog. Therefore a clean
+//     no-win pass (zero candidates OR every candidate definitively held, no transients)
+//     may NEVER declare `empty`/drained on one read. It must CONFIRM: wait `confirmDelayMs`
+//     and re-list, and only reach `empty` after the confirm window (spanning the passes)
+//     elapses still finding nothing claimable. A genuinely-empty backlog still reaches
+//     exit-10 — just after the confirm, not on the first read.
+// Result kinds: won | empty (drained, confirmed) | degraded (lister down / all-transient)
+// | no-identity. Confirm window ≈ (maxPasses-1) × confirmDelayMs ≥ observed ~5s lag.
+export function nextWalk({ listIssues, claimFn, isBlockerOpen, skipBlocked = false, maxPasses = 4, sleep = () => {}, confirmDelayMs = 3000 }) {
+  for (let pass = 0; pass < maxPasses; pass++) {
+    const last = pass === maxPasses - 1;
+    const issues = listIssues();
+    if (!issues || issues.degraded) {                 // lister down this pass
+      if (last) return { kind: "degraded" };
+      sleep(backoffMs(pass));
+      continue;
+    }
+    let sawDegraded = false;
+    for (const it of issues) {
+      if (skipBlocked) {
+        let blocked = false;
+        for (const b of parseBlockers(it.body)) { if (isBlockerOpen(b)) { blocked = true; break; } }
+        if (blocked) continue;
+      }
+      const r = claimFn(it.number);
+      if (r.result === "won") return { kind: "won", number: it.number };
+      if (r.result === "no-identity") return { kind: "no-identity" };
+      if (r.result === "degraded") { sawDegraded = true; continue; } // SOFT-skip, keep walking
+      // held / expired-then-lost → try the next candidate
+    }
+    if (sawDegraded) {                                 // transient in play → backoff & retry
+      if (last) return { kind: "degraded" };
+      sleep(backoffMs(pass));
+      continue;
+    }
+    // Clean no-win pass (zero candidates, or every candidate held) — could be index lag.
+    if (last) return { kind: "empty" };                // confirm window elapsed → truly drained
+    sleep(confirmDelayMs);                             // CONFIRM-BEFORE-DRAIN: wait out lag, re-list
+  }
+  return { kind: "empty" };                             // defensive; loop always returns first
+}
+
 // ---------- gh plumbing (the only I/O; everything above is pure) ----------
 
 function ghRaw(args, input) {
   const r = spawnSync("gh", args, { input, encoding: "utf8" });
   return { status: r.status, out: (r.stdout || "").trim(), err: (r.stderr || "").trim() };
 }
-function isTransient(err) {
-  return /rate limit|secondary rate|abuse|\b5\d\d\b|timeout|timed out|EAI_AGAIN|ECONNRESET|temporarily/i.test(err);
+// A transient is anything worth retrying: 5xx, network resets, AND the rate-limit family.
+// GitHub's SECONDARY rate limit / abuse-detection (a burst of ref+commit writes from a
+// racing fleet) surfaces as 403/429 with "secondary rate limit"/"abuse" wording or a
+// `Retry-After` header — those MUST retry, never be mistaken for a business error.
+export function isTransient(err) {
+  return /rate limit|secondary rate|abuse|retry[- ]after|\b(?:5\d\d|429)\b|timeout|timed out|EAI_AGAIN|ECONNRESET|temporarily/i.test(err);
+}
+// If GitHub told us how long to wait, honor it (bounded), else null → caller backs off.
+export function retryAfterMs(err, capMs = 30_000) {
+  const m = /retry[- ]after[:"\s]+(\d+)/i.exec(String(err));
+  if (!m) return null;
+  return Math.min(Math.max(Number(m[1]), 1) * 1000, capMs);
 }
 const sleep = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* no SAB → skip */ } };
 
@@ -138,7 +228,8 @@ function gh(method, path, body, { retry = MAX_RETRY } = {}) {
     if (last.status === 0) return last;
     if (/already exists/i.test(last.err)) return last;     // terminal business error
     if (!isTransient(last.err) || attempt === retry) return last;
-    sleep(backoffMs(attempt));
+    const ra = retryAfterMs(last.err);                     // honor GitHub's Retry-After if given
+    sleep(ra != null ? ra : backoffMs(attempt));
   }
   return last;
 }
@@ -238,6 +329,28 @@ export function listLeases() {
   return out;
 }
 
+// IO: the open-issue backlog, oldest-first, as {number,title,body,assignee}. Drops
+// pull requests. `labels` (csv) / `milestone` (number) narrow server-side; `unassigned`
+// keeps only assignee===null (client-side). Fail-OPEN: any gh trouble → {degraded:true}
+// so `next` proceeds unlocked instead of crashing. gh fills owner/repo from the cwd.
+export function listOpenIssues({ labels = null, milestone = null, unassigned = false } = {}, _env = process.env) {
+  let path = "issues?state=open&sort=created&direction=asc&per_page=100";
+  if (labels) path += `&labels=${encodeURIComponent(labels)}`;
+  if (milestone !== null && milestone !== undefined && String(milestone) !== "") path += `&milestone=${encodeURIComponent(milestone)}`;
+  const r = gh("GET", path);
+  if (r.status !== 0) return { degraded: true };
+  let items;
+  try { items = JSON.parse(r.out); } catch { return { degraded: true }; }
+  if (!Array.isArray(items)) return { degraded: true };
+  const out = [];
+  for (const it of items) {
+    if (it.pull_request) continue;                       // issues endpoint also returns PRs
+    if (unassigned && it.assignee !== null) continue;    // keep only unassigned
+    out.push({ number: it.number, title: it.title, body: it.body, assignee: it.assignee });
+  }
+  return out;
+}
+
 // ---------- CLI ----------
 
 const IDENTITY_HINT = "Set a unique AGENT_ID per agent (child sub-agents inherit it), e.g. export AGENT_ID=codex-7";
@@ -268,6 +381,72 @@ function cmdReap() {
     if (expired || closed) { if (release(num)) { reaped++; console.log(`  reaped #${num} (${closed ? "issue closed" : "expired"})`); } }
   }
   console.log(`reaped ${reaped} lease(s)`);
+  return 0;
+}
+
+// `next` — atomically pop the next unclaimed open issue from a filtered backlog.
+// Bare winning number → stdout (scriptable: ISSUE=$(gh-issue-lease next --label ready));
+// human line → stderr. Exit 0 won/degraded · 3 no AGENT_ID · 10 queue drained.
+function cmdNext(rest) {
+  const labels = [];
+  let milestone = null, unassigned = false, skipBlocked = false, ttlMin = DEFAULT_TTL_MIN;
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    if (a === "--label") labels.push(rest[++i]);
+    else if (a.startsWith("--label=")) labels.push(a.slice(8));
+    else if (a === "--milestone") milestone = rest[++i];
+    else if (a.startsWith("--milestone=")) milestone = a.slice(12);
+    else if (a === "--unassigned") unassigned = true;
+    else if (a === "--skip-blocked") skipBlocked = true;
+    else if (a === "--ttl") ttlMin = Number(rest[++i]) || DEFAULT_TTL_MIN;
+    else if (a.startsWith("--ttl=")) ttlMin = Number(a.slice(6)) || DEFAULT_TTL_MIN;
+  }
+  const blockerState = new Map(); // cache blocker-state lookups within this call
+  const isBlockerOpen = (b) => {
+    if (blockerState.has(b)) return blockerState.get(b);
+    const r = gh("GET", `issues/${b}`);
+    let open = false; // closed OR missing OR unreadable ⇒ not blocking
+    if (r.status === 0) { try { open = JSON.parse(r.out).state === "open"; } catch { open = false; } }
+    blockerState.set(b, open);
+    return open;
+  };
+  const result = nextWalk({
+    listIssues: () => listOpenIssues({ labels: labels.length ? labels.join(",") : null, milestone, unassigned }),
+    claimFn: (n) => claim(n, { ttlMin }),
+    isBlockerOpen,
+    skipBlocked,
+    sleep, // real backoff between retry passes under live rate-limit pressure
+  });
+  switch (result.kind) {
+    case "won":
+      writeState("issue", { issue: result.number });
+      console.log(String(result.number));                     // bare number, scriptable
+      console.error(`🔒 claimed next issue #${result.number}`);
+      return 0;
+    case "no-identity":
+      console.error(`✗ AGENT_ID is not set — refusing to claim. ${IDENTITY_HINT}`);
+      return 3;
+    case "degraded":
+      console.error("⚠ leasing unavailable (gh offline/unauthed) — proceed WITHOUT a lease.");
+      return 0;
+    default: // "empty"
+      console.error("no unclaimed issue available in the filtered queue (all claimed or blocked)");
+      return 10;
+  }
+}
+
+// `mine` — the issues I currently hold (owner === my AGENT_ID). Always exit 0.
+function cmdMine() {
+  const me = resolveOwner();
+  const held = [];
+  for (const num of listLeases()) {
+    const h = getHolder(num);
+    if (!h || h.owner !== me) continue;
+    const ageMin = Math.round((Date.now() - Date.parse(h.claimedAt)) / 60000);
+    held.push(`#${num}  ${ageMin}m old  ttl ${h.ttlMin}m${isExpired(h.claimedAt, h.ttlMin, Date.now()) ? "  (expired)" : ""}`);
+  }
+  if (!held.length) { console.error(me ? "no issues held" : `no issues held (AGENT_ID unset). ${IDENTITY_HINT}`); return 0; }
+  for (const line of held) console.log(line);
   return 0;
 }
 
@@ -448,6 +627,8 @@ function main(argv) {
       clearState("issue"); // cosmetic breadcrumb; no-op unless agent-refs installed
       return ok ? (console.log("released"), 0) : (console.log("no lease to release"), 0);
     }
+    case "next": return cmdNext(rest);
+    case "mine": return cmdMine();
     case "status": return cmdStatus(pos[0]);
     case "reap": return cmdReap();
     case "guard-push": {
@@ -469,7 +650,7 @@ function main(argv) {
     case "codex-hook": return cmdCodexHook(rest);
     case "claude-hook": return cmdClaudeHook(rest);
     default:
-      console.error("gh-issue-lease: claim <N> | release <N> | renew <N> | status [<N>] | reap | guard-push <branch> | hook | codex-hook | claude-hook [--block]");
+      console.error("gh-issue-lease: claim <N> | next [--label X].. [--milestone N] [--unassigned] [--skip-blocked] [--ttl N] | mine | release <N> | renew <N> | status [<N>] | reap | guard-push <branch> | hook | codex-hook | claude-hook [--block]");
       return 2;
   }
 }

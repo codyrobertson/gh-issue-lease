@@ -64,12 +64,54 @@ Because the lock is a server-side atomic ref, this is race-proof across machines
 | Command | Exit | Meaning |
 |---|---|---|
 | `claim <N>` | `0` won/degraded · `1` held · `3` no AGENT_ID | Lease issue N. Run before working it. |
+| `next [filters]` | `0` won/degraded · `3` no AGENT_ID · `10` drained | Atomically pop + claim the next unclaimed open issue. Prints the bare number. |
+| `mine` | `0` | The issues you currently hold (owner === your `AGENT_ID`). |
 | `release <N>` | `0` | Drop the lease. |
 | `renew <N>` | `0` renewed · `1` held · `3` no id | Heartbeat for a task that outlasts the TTL. |
 | `status [<N>]` | `0` | Who holds what (great as a CI/observability step). |
 | `reap` | `0` | Delete expired + closed-issue leases. |
 | `guard-push <branch>` | `0` allowed · `1` blocked | Read-only ownership check (used by the optional pre-push hook). |
 | `hook` / `codex-hook` / `claude-hook [--block]` | `0` | Optional provider adapters (below). |
+
+---
+
+## Work queue: `next` (atomic pop from a shared backlog)
+
+`claim <N>` presumes the agent already knows its issue. A *fleet* doesn't — it needs to **pull** work. `next` atomically pops the next unclaimed open issue from a filtered backlog and claims it in one step, so N agents racing the same queue each get a **distinct** issue (exactly-once, same server-side atomic-ref guarantee as `claim`).
+
+```sh
+# Pop the next ready issue and capture its number — the winning number is the ONLY thing on stdout:
+ISSUE=$(AGENT_ID=agent-7 gh-issue-lease next --label ready)
+case $? in
+  0)  echo "working #$ISSUE" ;;        # won (or degraded → $ISSUE empty, proceed unlocked)
+  10) echo "queue drained, nothing to do"; exit 0 ;;   # backlog empty / all claimed
+  3)  echo "set AGENT_ID"; exit 1 ;;   # fail closed
+esac
+```
+
+The bare issue number goes to **stdout** (scriptable); the human/status line goes to **stderr**, so `$(… next …)` captures only the number.
+
+**Filters** (all optional, combine freely):
+
+| Flag | Effect |
+|---|---|
+| `--label X` | Only issues with label `X`. Repeatable — collected into an AND set. |
+| `--milestone N` | Only issues in milestone number `N`. |
+| `--unassigned` | Only issues with no GitHub assignee. |
+| `--skip-blocked` | Skip any issue whose body declares an **open** blocker (see below). |
+| `--ttl N` | Lease TTL in minutes for this claim (overrides `AGENT_LEASE_TTL_MIN`). |
+
+**Dependency-aware (`--skip-blocked`).** The body is scanned for blocker refs — `blocked by #N`, `blocked-by #N`, `depends on #N`, `depends-on #N`, and unchecked task-list items `- [ ] #N` (a checked `- [x] #N` is *not* a blocker). If any referenced issue is still **open**, the candidate is skipped; closed/missing blockers don't block. So `next --label ready --skip-blocked` hands out only issues whose prerequisites are done.
+
+Candidates are tried **oldest-first**; contended ones (someone else won the race) are skipped transparently until one is won or the queue is **drained → exit 10**.
+
+**See what you hold** with `mine`:
+
+```sh
+$ AGENT_ID=agent-7 gh-issue-lease mine
+#412  12m old  ttl 240m
+#530  305m old  ttl 240m  (expired)
+```
 
 ---
 
