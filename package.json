@@ -14,7 +14,7 @@
     "hooks/pre-push"
   ],
   "scripts": {
-    "build": "esbuild src/issue-lease.mjs --minify --format=esm --platform=node --legal-comments=none --outfile=dist/issue-lease.mjs && chmod +x dist/issue-lease.mjs",
+    "build": "esbuild src/issue-lease.mjs --bundle --minify --format=esm --platform=node --legal-comments=none --outfile=dist/issue-lease.mjs && chmod +x dist/issue-lease.mjs",
     "prepack": "npm run build",
     "test": "node --test"
   },

@@ -39,6 +39,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { realpathSync, readFileSync, writeFileSync, statSync } from "node:fs";
 import { join, dirname, resolve, isAbsolute } from "node:path";
+import { writeState, clearState } from "./state.mjs";
 
 const DEFAULT_TTL_MIN = Number(process.env.AGENT_LEASE_TTL_MIN) || 240;
 const NAMESPACE = (process.env.ISSUE_LEASE_NAMESPACE || "leases").replace(/^\/+|\/+$/g, "");
@@ -432,7 +433,7 @@ function main(argv) {
   switch (cmd) {
     case "claim": {
       const r = claim(pos[0], {});
-      if (r.result === "won") { console.log("won"); return 0; }
+      if (r.result === "won") { writeState("issue", { issue: normalizeIssue(pos[0]) }); console.log("won"); return 0; }
       if (r.result === "degraded") { console.error("⚠ leasing unavailable (gh offline/unauthed) — proceed WITHOUT a lease."); console.log("degraded"); return 0; }
       if (r.result === "no-identity") { console.error(`✗ AGENT_ID is not set — refusing to claim. ${IDENTITY_HINT}`); return 3; }
       console.error(`held by ${r.holder?.owner || "another agent"}`); return 1;
@@ -442,7 +443,11 @@ function main(argv) {
       if (r.result === "no-identity") { console.error(`✗ AGENT_ID is not set. ${IDENTITY_HINT}`); return 3; }
       console.log(r.result); return r.result === "held" ? 1 : 0;
     }
-    case "release": return release(pos[0]) ? (console.log("released"), 0) : (console.log("no lease to release"), 0);
+    case "release": {
+      const ok = release(pos[0]);
+      clearState("issue"); // cosmetic breadcrumb; no-op unless agent-refs installed
+      return ok ? (console.log("released"), 0) : (console.log("no lease to release"), 0);
+    }
     case "status": return cmdStatus(pos[0]);
     case "reap": return cmdReap();
     case "guard-push": {
