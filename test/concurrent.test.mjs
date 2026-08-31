@@ -14,6 +14,7 @@ import { randomBytes } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { gitCasArgs } from "../src/issue-lease.mjs";
 
 const SRC = resolve(dirname(fileURLToPath(import.meta.url)), "../src/issue-lease.mjs");
 const REPO = process.env.GH_REPO || "";
@@ -38,6 +39,11 @@ function leaseRefExists(n) {
     { encoding: "utf8", env: { ...process.env, GH_REPO: REPO } });
   return r.status === 0; // 200 ⇒ ref exists; 404 ⇒ gone
 }
+function leaseTreeSha(n) {
+  const ref = gh(["api", `repos/${OWNER}/${NAME}/git/ref/leases/issue-${n}`], { json: true });
+  const commit = gh(["api", `repos/${OWNER}/${NAME}/git/commits/${ref.object.sha}`], { json: true });
+  return commit.tree.sha;
+}
 function runNext(label, agentId) {
   return new Promise((res) => {
     const p = spawn(process.execPath, [SRC, "next", "--label", label], {
@@ -49,6 +55,60 @@ function runNext(label, agentId) {
     p.on("close", (code) => res({ code, out: out.trim(), err: err.trim() }));
   });
 }
+
+function localCommit(message) {
+  const tree = spawnSync("git", ["mktree"], { input: "", encoding: "utf8" }).stdout.trim();
+  const r = spawnSync("git", ["commit-tree", tree], {
+    input: message,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      GIT_AUTHOR_NAME: "gh-issue-lease-test",
+      GIT_AUTHOR_EMAIL: "gh-issue-lease-test@users.noreply.github.com",
+      GIT_COMMITTER_NAME: "gh-issue-lease-test",
+      GIT_COMMITTER_EMAIL: "gh-issue-lease-test@users.noreply.github.com",
+    },
+  });
+  if (r.status !== 0) throw new Error(r.stderr || "commit-tree failed");
+  return r.stdout.trim();
+}
+
+function cas(remote, ref, expected, next) {
+  return spawnSync("git", gitCasArgs(remote, ref, expected, next), { encoding: "utf8" });
+}
+
+test("expected-old OID rejects delayed delete and admits only one replacement", { skip: !LIVE }, async () => {
+  const uniq = `${Date.now()}-${randomBytes(3).toString("hex")}`;
+  const ref = `refs/leases/cas-citest-${uniq}`;
+  const remote = `https://github.com/${REPO}.git`;
+  const first = localCommit("cas first");
+  const renewed = localCommit("cas renewed");
+  const contenderA = localCommit("cas contender a");
+  const contenderB = localCommit("cas contender b");
+  let current = null;
+  try {
+    assert.equal(cas(remote, ref, null, first).status, 0, "create-only CAS must win on an absent ref");
+    current = first;
+    assert.equal(cas(remote, ref, first, renewed).status, 0, "renew must swap the observed generation");
+    current = renewed;
+    assert.notEqual(cas(remote, ref, first, null).status, 0, "a delayed release must not delete the renewed generation");
+
+    const [a, b] = await Promise.all([
+      new Promise((resolve) => {
+        const p = spawn("git", gitCasArgs(remote, ref, renewed, contenderA));
+        p.on("close", (status) => resolve(status));
+      }),
+      new Promise((resolve) => {
+        const p = spawn("git", gitCasArgs(remote, ref, renewed, contenderB));
+        p.on("close", (status) => resolve(status));
+      }),
+    ]);
+    assert.equal([a, b].filter((status) => status === 0).length, 1, "exactly one same-generation replacement may win");
+    current = a === 0 ? contenderA : contenderB;
+  } finally {
+    if (current) assert.equal(cas(remote, ref, current, null).status, 0, "cleanup must delete the exact surviving generation");
+  }
+});
 
 test("N racers each pop a DISTINCT issue; every lease ref is cleaned up", { skip: !LIVE }, async () => {
   const K = 6;                       // issues
@@ -89,6 +149,13 @@ test("N racers each pop a DISTINCT issue; every lease ref is cleaned up", { skip
     for (const w of winners) assert.ok(created.includes(w), `winner ${w} is not a created issue`);
     // with N>K and K distinct issues, all K should be won (racers exceed supply)
     assert.equal(winners.length, K, `expected ${K} winners, got ${winners.length}`);
+    for (const w of winners) {
+      assert.equal(
+        leaseTreeSha(w),
+        "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+        `lease ${w} must use Git's empty tree, never the caller checkout`,
+      );
+    }
   } finally {
     // Cleanup — asserted, not narrated.
     for (const n of created) {

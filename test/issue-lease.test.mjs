@@ -9,6 +9,7 @@ import {
   refShort, refFull, resolveOwner, parseLeaseMessage, isExpired,
   normalizeIssue, backoffMs, issueFromBranch, pushDecision, hookDecision, codexEvent,
   parseHeadRef, parseDotGitFile, parseBlockers, nextWalk, isTransient, retryAfterMs,
+  orderIssuesForOwner, gitCasArgs, leaseMutationDecision, shouldRetryCasConflict,
 } from "../src/issue-lease.mjs";
 
 const SRC = resolve(dirname(fileURLToPath(import.meta.url)), "../src/issue-lease.mjs");
@@ -67,6 +68,67 @@ test("normalizeIssue accepts positive ints, rejects everything else", () => {
 test("backoff grows, jittered, capped at 30s", () => {
   assert.ok(backoffMs(3, () => 0) < backoffMs(3, () => 1));
   assert.ok(backoffMs(10, () => 1) <= 30000);
+});
+
+test("git CAS pins the exact expected remote oid for create, replace, and delete", () => {
+  assert.deepEqual(gitCasArgs("origin", "refs/leases/issue-7", null, "new-sha"), [
+    "push", "--porcelain", "--force-with-lease=refs/leases/issue-7:",
+    "origin", "new-sha:refs/leases/issue-7",
+  ]);
+  assert.deepEqual(gitCasArgs("origin", "refs/leases/issue-7", "old-sha", "new-sha"), [
+    "push", "--porcelain", "--force-with-lease=refs/leases/issue-7:old-sha",
+    "origin", "new-sha:refs/leases/issue-7",
+  ]);
+  assert.deepEqual(gitCasArgs("origin", "refs/leases/issue-7", "old-sha", null), [
+    "push", "--porcelain", "--force-with-lease=refs/leases/issue-7:old-sha",
+    "origin", ":refs/leases/issue-7",
+  ]);
+});
+
+test("lease mutation decisions never overwrite or delete without the observed oid", () => {
+  const liveOther = { owner: "other", sha: "live", claimedAt: "2026-07-03T11:59:00Z", ttlMin: 240 };
+  const staleOther = { owner: "other", sha: "stale", claimedAt: "2026-07-03T01:00:00Z", ttlMin: 240 };
+  const mine = { owner: "me", sha: "mine", claimedAt: "2026-07-03T11:59:00Z", ttlMin: 240 };
+  const nowMs = Date.parse("2026-07-03T12:00:00Z");
+
+  assert.deepEqual(leaseMutationDecision({ action: "claim", owner: "me", holder: null, nowMs }),
+    { kind: "cas", expectedSha: null });
+  assert.deepEqual(leaseMutationDecision({ action: "claim", owner: "me", holder: liveOther, nowMs }),
+    { kind: "held", holder: liveOther });
+  assert.deepEqual(leaseMutationDecision({ action: "claim", owner: "me", holder: staleOther, nowMs }),
+    { kind: "cas", expectedSha: "stale" });
+  assert.deepEqual(leaseMutationDecision({ action: "renew", owner: "me", holder: mine, nowMs }),
+    { kind: "cas", expectedSha: "mine" });
+  assert.deepEqual(leaseMutationDecision({ action: "release", owner: "me", holder: liveOther, nowMs }),
+    { kind: "held", holder: liveOther });
+  assert.deepEqual(leaseMutationDecision({ action: "release", owner: "me", holder: mine, nowMs }),
+    { kind: "cas", expectedSha: "mine" });
+});
+
+test("a delete intent never retargets itself after losing its observed generation", () => {
+  assert.equal(shouldRetryCasConflict("claim"), true);
+  assert.equal(shouldRetryCasConflict("renew"), true);
+  assert.equal(shouldRetryCasConflict("release"), false);
+});
+
+test("64 queue workers distribute first choices with subquadratic contention", () => {
+  const issues = Array.from({ length: 64 }, (_, i) => ({ number: 10_000 + i, body: "" }));
+  const claimed = new Set();
+  let attempts = 0;
+  for (let worker = 0; worker < 64; worker += 1) {
+    const ordered = orderIssuesForOwner(issues, `fleet-worker-${worker}`);
+    assert.deepEqual(new Set(ordered.map((issue) => issue.number)), new Set(issues.map((issue) => issue.number)));
+    const winner = ordered.find((issue) => {
+      attempts += 1;
+      return !claimed.has(issue.number);
+    });
+    assert.ok(winner);
+    claimed.add(winner.number);
+  }
+  assert.equal(claimed.size, 64);
+  // Randomized/rendezvous allocation is expected O(N log N), versus the old
+  // oldest-first N(N+1)/2 herd (2,080 attempts at N=64).
+  assert.ok(attempts <= 64 * 4, `expected subquadratic attempts, observed ${attempts}`);
 });
 
 test("issueFromBranch extracts issue #, null for non-issue branches", () => {
@@ -344,7 +406,7 @@ test("claim without AGENT_ID fails closed (exit 3), does not touch the network",
 });
 
 test("claude-hook is a silent no-op on a non-issue branch (no stdout, exit 0)", () => {
-  const payload = JSON.stringify({ hook_event_name: "SessionStart", cwd: dirname(SRC) });
+  const payload = JSON.stringify({ hook_event_name: "SessionStart", cwd: tmpdir() });
   const r = spawnSync(process.execPath, [SRC, "claude-hook"], { input: payload, encoding: "utf8", env: { ...process.env, AGENT_ID: "x" } });
   assert.equal(r.status, 0);
   assert.equal(r.stdout, "");
