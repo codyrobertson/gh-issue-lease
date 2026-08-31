@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 // gh-issue-lease — an atomic, GitHub-native mutex for multi-agent work.
 //
-// The lock IS a git ref: `refs/leases/issue-<N>`. Creating a ref is atomic on
-// GitHub's backend, so the FIRST writer gets HTTP 201 and everyone else gets 422
-// "Reference already exists". That one fact is the whole primitive — a real
-// server-side mutex with no database and nothing to run.
+// The lock IS a git ref: `refs/leases/issue-<N>`. Every mutation is sent through
+// Git receive-pack with an explicit expected old OID (`--force-with-lease`), so
+// create, renewal, expired takeover, and deletion are all server-side CAS. A
+// delayed writer can never overwrite or erase a newer lease generation.
 //
 // IDENTITY IS STRICT AND AGENT-AGNOSTIC. The owner of a lease is `AGENT_ID`, a
 // unique label the LAUNCHER sets per logical agent. Child sub-agents/threads/procs
@@ -39,6 +39,7 @@
 //      ISSUE_LEASE_NAMESPACE (default "leases"), GH_ISSUE_LEASE_MAX_RETRY (default 5).
 
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { realpathSync, readFileSync, writeFileSync, statSync } from "node:fs";
 import { join, dirname, resolve, isAbsolute } from "node:path";
@@ -80,6 +81,47 @@ export function normalizeIssue(n) {
 export function backoffMs(attempt, rng = Math.random) {
   const base = Math.min(1000 * 2 ** attempt, 30_000);
   return Math.round(base / 2 + rng() * (base / 2));
+}
+
+// Give every logical worker a stable permutation of the same queue. Independent
+// workers therefore begin on different issues instead of stampeding the oldest
+// ref, while every worker still retains complete deterministic queue coverage.
+export function orderIssuesForOwner(issues, owner) {
+  if (!owner) return [...issues];
+  const scored = issues.map((issue) => ({
+    issue,
+    score: createHash("sha256").update(`${owner}\0${issue.number}`).digest("hex"),
+  }));
+  scored.sort((a, b) => b.score.localeCompare(a.score) || a.issue.number - b.issue.number);
+  return scored.map(({ issue }) => issue);
+}
+
+// Explicit expected-old-OID force-with-lease is Git's compare-and-swap. An empty
+// expectation means create-only; a null next SHA means delete-only.
+export function gitCasArgs(remote, ref, expectedSha, nextSha) {
+  return [
+    "push",
+    "--porcelain",
+    `--force-with-lease=${ref}:${expectedSha ?? ""}`,
+    remote,
+    `${nextSha ?? ""}:${ref}`,
+  ];
+}
+
+export function leaseMutationDecision({ action, owner, holder, nowMs = Date.now() }) {
+  if (!holder) return action === "release" ? { kind: "missing" } : { kind: "cas", expectedSha: null };
+  if (action === "claim" && holder.owner === owner) return { kind: "owned", holder };
+  if (action === "release") {
+    return holder.owner === owner ? { kind: "cas", expectedSha: holder.sha } : { kind: "held", holder };
+  }
+  if (holder.owner !== owner && !isExpired(holder.claimedAt, holder.ttlMin, nowMs)) {
+    return { kind: "held", holder };
+  }
+  return { kind: "cas", expectedSha: holder.sha };
+}
+
+export function shouldRetryCasConflict(action) {
+  return action !== "release";
 }
 
 // Extract the issue number from a branch (`<type>/<N>-<slug>` or `issue-<N>`).
@@ -161,7 +203,7 @@ export function parseBlockers(body) {
 //     exit-10 — just after the confirm, not on the first read.
 // Result kinds: won | empty (drained, confirmed) | degraded (lister down / all-transient)
 // | no-identity. Confirm window ≈ (maxPasses-1) × confirmDelayMs ≥ observed ~5s lag.
-export function nextWalk({ listIssues, claimFn, isBlockerOpen, skipBlocked = false, maxPasses = 4, sleep = () => {}, confirmDelayMs = 3000 }) {
+export function nextWalk({ listIssues, claimFn, isBlockerOpen, skipBlocked = false, maxPasses = 4, sleep = () => {}, confirmDelayMs = 3000, owner = null }) {
   for (let pass = 0; pass < maxPasses; pass++) {
     const last = pass === maxPasses - 1;
     const issues = listIssues();
@@ -171,7 +213,7 @@ export function nextWalk({ listIssues, claimFn, isBlockerOpen, skipBlocked = fal
       continue;
     }
     let sawDegraded = false;
-    for (const it of issues) {
+    for (const it of orderIssuesForOwner(issues, owner)) {
       if (skipBlocked) {
         let blocked = false;
         for (const b of parseBlockers(it.body)) { if (isBlockerOpen(b)) { blocked = true; break; } }
@@ -235,29 +277,83 @@ function gh(method, path, body, { retry = MAX_RETRY } = {}) {
 }
 
 let TREE = null;
-// Any existing tree sha works as the lease commit's tree (it carries no files).
-// `commits/HEAD` returns the default branch tip's tree in ONE call.
+// The lease commit carries no files. Use Git's canonical empty tree so targeting
+// a different GH_REPO can never copy the checkout's tree/blobs into that repo.
 function baseTree() {
   if (TREE) return TREE;
-  const r = gh("GET", "commits/HEAD");
-  if (r.status !== 0) throw new Error("gh unavailable");
-  return (TREE = JSON.parse(r.out).commit.tree.sha);
+  const r = spawnSync("git", ["mktree"], { input: "", encoding: "utf8" });
+  if (r.status !== 0 || !r.stdout.trim()) throw new Error("git checkout unavailable");
+  return (TREE = r.stdout.trim());
 }
 function getHolder(n) {
   const ref = gh("GET", `git/ref/${refShort(n)}`);
-  if (ref.status !== 0) return null;
-  const sha = JSON.parse(ref.out).object.sha;
-  const commit = JSON.parse(gh("GET", `git/commits/${sha}`).out);
-  return { ...parseLeaseMessage(commit.message), claimedAt: commit.committer.date, sha };
+  if (ref.status !== 0) return /\b404\b|not found/i.test(ref.err) ? null : undefined;
+  let sha;
+  try { sha = JSON.parse(ref.out).object.sha; } catch { return undefined; }
+  if (typeof sha !== "string" || !/^[0-9a-f]{40,64}$/i.test(sha)) return undefined;
+  const commitResult = gh("GET", `git/commits/${sha}`);
+  if (commitResult.status !== 0) return undefined;
+  let commit;
+  try { commit = JSON.parse(commitResult.out); } catch { return undefined; }
+  if (!commit || typeof commit.message !== "string" || typeof commit.committer?.date !== "string") return undefined;
+  let envelope = {};
+  try { envelope = JSON.parse(commit.message); } catch { /* v1 malformed messages remain reclaimable */ }
+  return { ...parseLeaseMessage(commit.message), claimedAt: envelope.claimedAt ?? commit.committer.date, sha };
 }
-function mkRef(n, message) {
-  const c = gh("POST", "git/commits", { message, tree: baseTree() });
-  if (c.status !== 0) return { result: "degraded" };
-  const sha = JSON.parse(c.out).sha;
-  const ref = gh("POST", "git/refs", { ref: refFull(n), sha });
-  if (ref.status === 0) return { result: "won" };
-  if (/already exists/i.test(ref.err)) return { result: "held" };
+
+function leaseCommit(message) {
+  const identity = {
+    GIT_AUTHOR_NAME: "gh-issue-lease",
+    GIT_AUTHOR_EMAIL: "gh-issue-lease@users.noreply.github.com",
+    GIT_COMMITTER_NAME: "gh-issue-lease",
+    GIT_COMMITTER_EMAIL: "gh-issue-lease@users.noreply.github.com",
+  };
+  const r = spawnSync("git", ["commit-tree", baseTree()], {
+    input: message,
+    encoding: "utf8",
+    env: { ...process.env, ...identity },
+  });
+  return r.status === 0 && r.stdout.trim() ? r.stdout.trim() : null;
+}
+
+function pushRemote() {
+  const repo = (process.env.GH_REPO || "").trim();
+  return repo.includes("/") ? `https://github.com/${repo}.git` : "origin";
+}
+
+function casRef(n, expectedSha, nextSha) {
+  const r = spawnSync("git", gitCasArgs(pushRemote(), refFull(n), expectedSha, nextSha), { encoding: "utf8" });
+  if (r.status === 0) return { result: "won" };
+  const detail = `${r.stdout || ""}\n${r.stderr || ""}`;
+  if (/stale info|\[rejected\]|remote ref already exists|cannot lock ref/i.test(detail)) return { result: "conflict" };
   return { result: "degraded" };
+}
+
+function leaseMessage(issue, owner, ttlMin) {
+  return JSON.stringify({ v: 2, issue, owner, ttlMin, claimedAt: new Date().toISOString() });
+}
+
+function mutateLease(issue, { action, owner, ttlMin }) {
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const holder = getHolder(issue);
+    if (holder === undefined) return { result: "degraded" };
+    const decision = leaseMutationDecision({ action, owner, holder });
+    if (decision.kind === "held") return { result: "held", holder: decision.holder };
+    if (decision.kind === "owned") return { result: "won", holder: decision.holder };
+    if (decision.kind === "missing") return { result: "missing" };
+    const nextSha = action === "release" ? null : leaseCommit(leaseMessage(issue, owner, ttlMin));
+    if (action !== "release" && !nextSha) return { result: "degraded" };
+    const swapped = casRef(issue, decision.expectedSha, nextSha);
+    if (swapped.result === "won") return { result: action === "renew" ? "renewed" : action === "release" ? "released" : "won" };
+    if (swapped.result === "degraded") return swapped;
+    if (!shouldRetryCasConflict(action)) return { result: "conflict" };
+    // A competing CAS won. Re-read its exact OID and classify again; never erase it.
+  }
+  const holder = getHolder(issue);
+  if (holder === undefined) return { result: "degraded" };
+  return holder?.owner === owner && action !== "release"
+    ? { result: action === "renew" ? "renewed" : "won", holder }
+    : { result: "held", holder };
 }
 
 // ---------- primitive ----------
@@ -268,48 +364,28 @@ export function claim(n, { ttlMin = DEFAULT_TTL_MIN, owner = resolveOwner() } = 
   const issue = normalizeIssue(n);
   if (issue === null) throw new Error(`invalid issue number: ${n}`);
   if (!owner) return { result: "no-identity" };
-  let message;
-  try { baseTree(); message = JSON.stringify({ v: 1, issue, owner, ttlMin }); }
+  let firstSha;
+  try { firstSha = leaseCommit(leaseMessage(issue, owner, ttlMin)); }
   catch { return { result: "degraded" }; }
-
-  const first = mkRef(issue, message);
-  if (first.result !== "held") return first;
-
-  const holder = getHolder(issue);
-  if (!holder) return mkRef(issue, message);                          // vanished → retry
-  if (holder.owner === owner) return { result: "won", holder };       // idempotent: already mine (parent↔child)
-  if (!isExpired(holder.claimedAt, holder.ttlMin, Date.now())) return { result: "held", holder };
-
-  gh("DELETE", `git/refs/${refShort(issue)}`);                        // expired → best-effort steal
-  const second = mkRef(issue, message);
-  if (second.result !== "held") return second;
-  const now = getHolder(issue);
-  if (now && now.owner === owner) return { result: "won", holder: now };
-  return { result: "held", holder: now };
+  if (!firstSha) return { result: "degraded" };
+  const first = casRef(issue, null, firstSha);
+  if (first.result === "won" || first.result === "degraded") return first;
+  return mutateLease(issue, { action: "claim", owner, ttlMin });
 }
 
 export function renew(n, { ttlMin = DEFAULT_TTL_MIN, owner = resolveOwner() } = {}) {
   const issue = normalizeIssue(n);
   if (issue === null) throw new Error(`invalid issue number: ${n}`);
   if (!owner) return { result: "no-identity" };
-  const holder = getHolder(issue);
-  if (holder && holder.owner !== owner && !isExpired(holder.claimedAt, holder.ttlMin, Date.now()))
-    return { result: "held", holder };
-  let message;
-  try { message = JSON.stringify({ v: 1, issue, owner, ttlMin }); baseTree(); }
+  try { baseTree(); }
   catch { return { result: "degraded" }; }
-  const c = gh("POST", "git/commits", { message, tree: baseTree() });
-  if (c.status !== 0) return { result: "degraded" };
-  const sha = JSON.parse(c.out).sha;
-  const up = gh("PATCH", `git/refs/${refShort(issue)}`, { sha, force: true });
-  if (up.status === 0) return { result: "renewed" };
-  return mkRef(issue, message).result === "won" ? { result: "renewed" } : { result: "degraded" };
+  return mutateLease(issue, { action: "renew", owner, ttlMin });
 }
 
-export function release(n) {
+export function release(n, { owner = resolveOwner() } = {}) {
   const issue = normalizeIssue(n);
-  if (issue === null) return false;
-  try { const d = gh("DELETE", `git/refs/${refShort(issue)}`); return d.status === 0; }
+  if (issue === null || !owner) return false;
+  try { return mutateLease(issue, { action: "release", owner, ttlMin: DEFAULT_TTL_MIN }).result === "released"; }
   catch { return false; }
 }
 
@@ -329,7 +405,8 @@ export function listLeases() {
   return out;
 }
 
-// IO: the open-issue backlog, oldest-first, as {number,title,body,assignee}. Drops
+// IO: the open-issue backlog as {number,title,body,assignee}. `nextWalk` applies
+// an owner-specific stable permutation before attempting claims. Drops
 // pull requests. `labels` (csv) / `milestone` (number) narrow server-side; `unassigned`
 // keeps only assignee===null (client-side). Fail-OPEN: any gh trouble → {degraded:true}
 // so `next` proceeds unlocked instead of crashing. gh fills owner/repo from the cwd.
@@ -378,7 +455,12 @@ function cmdReap() {
       const iv = ghRaw(["issue", "view", String(num), "--json", "state", "--jq", ".state"]);
       if (iv.status === 0) closed = iv.out === "CLOSED";
     }
-    if (expired || closed) { if (release(num)) { reaped++; console.log(`  reaped #${num} (${closed ? "issue closed" : "expired"})`); } }
+    // Reap the exact observed generation. A concurrent renew/reclaim changes the
+    // OID and makes this CAS fail instead of deleting the replacement lease.
+    if ((expired || closed) && h && casRef(num, h.sha, null).result === "won") {
+      reaped++;
+      console.log(`  reaped #${num} (${closed ? "issue closed" : "expired"})`);
+    }
   }
   console.log(`reaped ${reaped} lease(s)`);
   return 0;
@@ -410,11 +492,13 @@ function cmdNext(rest) {
     blockerState.set(b, open);
     return open;
   };
+  const owner = resolveOwner();
   const result = nextWalk({
     listIssues: () => listOpenIssues({ labels: labels.length ? labels.join(",") : null, milestone, unassigned }),
-    claimFn: (n) => claim(n, { ttlMin }),
+    claimFn: (n) => claim(n, { ttlMin, owner }),
     isBlockerOpen,
     skipBlocked,
+    owner,
     sleep, // real backoff between retry passes under live rate-limit pressure
   });
   switch (result.kind) {

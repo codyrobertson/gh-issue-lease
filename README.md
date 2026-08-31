@@ -14,9 +14,11 @@ Zero runtime dependencies, one small file. Needs the [`gh` CLI](https://cli.gith
 
 ## How it works (and why there's no database)
 
-The lock **is** a git ref: `refs/leases/issue-<N>`. Creating a ref is **atomic on GitHub's backend** — the first `POST /git/refs` gets `201`, every later one gets `422 "Reference already exists"`. That's the whole primitive: a real server-side mutex with nothing to run. The ref points at a tiny commit whose message carries `{owner, ttlMin}` and whose GitHub-set date is the lease clock, so a crashed agent's lease **expires and is reclaimed** on its own.
+The lock **is** a git ref: `refs/leases/issue-<N>`. Every create, renewal, expired takeover, and deletion is an exact-OID compare-and-swap through Git receive-pack (`git push --force-with-lease=<ref>:<expected>`). GitHub updates the ref only when its current OID is exactly the generation the caller observed. A delayed release cannot delete a renewal, and two stale reclaimers cannot overwrite or erase the winner. The ref points at a tiny local commit whose message carries `{owner, ttlMin, claimedAt}`; a crashed agent's lease expires and can be atomically replaced.
 
 > **Why not an embedded database?** A mutex only works if every worker sees the *same* lock. GitHub is the shared, atomic, already-authenticated store everyone can already reach. An embedded DB (SQLite) is per-machine and can't be that shared store. GitHub already is.
+
+The CLI reads through authenticated `gh api` and performs CAS writes through the checkout's Git transport. Run `gh auth setup-git` once anywhere `git push` does not already authenticate. When `GH_REPO=owner/name` is set, the CAS targets that repository's HTTPS remote explicitly; otherwise it uses `origin`.
 
 ---
 
@@ -103,7 +105,7 @@ The bare issue number goes to **stdout** (scriptable); the human/status line goe
 
 **Dependency-aware (`--skip-blocked`).** The body is scanned for blocker refs — `blocked by #N`, `blocked-by #N`, `depends on #N`, `depends-on #N`, and unchecked task-list items `- [ ] #N` (a checked `- [x] #N` is *not* a blocker). If any referenced issue is still **open**, the candidate is skipped; closed/missing blockers don't block. So `next --label ready --skip-blocked` hands out only issues whose prerequisites are done.
 
-Candidates are tried **oldest-first**; contended ones (someone else won the race) are skipped transparently until one is won or the queue is **drained → exit 10**.
+Each `AGENT_ID` gets a stable rendezvous-hashed permutation of the eligible candidates. A large fleet therefore spreads its first attempts across the backlog instead of stampeding the oldest issue; contended candidates are skipped transparently until one is won or the queue is **drained → exit 10**. Every permutation contains the complete candidate set, so distribution does not sacrifice coverage.
 
 **See what you hold** with `mine`:
 
@@ -164,7 +166,9 @@ notify = ["gh-issue-lease", "codex-hook"]
 | Agent crashes holding a lease | Expires after `AGENT_LEASE_TTL_MIN` (default 240m); next claimer reclaims it. |
 | Task outlasts the TTL | `renew <N>` re-stamps the clock; crashed agents don't renew. |
 | Network blip after the ref was created | Retry sees `422`, owner is you → `won`. Idempotent. |
-| Stealing an expired lease | Best-effort delete+recreate; GitHub refs have no CAS, so the hard guarantee stays the atomic *create*. Keep TTL conservative. |
+| Stealing an expired lease | Exact-OID CAS replaces the observed expired generation directly; there is no unlocked delete/recreate gap. |
+| Renewal races a stale reclaimer | Exactly one expected-old-OID update wins; the loser re-reads and cannot overwrite the winner. |
+| Delayed release races renewal/takeover | The delete is fenced to the observed OID and is rejected after the ref advances. |
 | `gh` offline / unauthed | Fails **open** — never blocks work. |
 | Two machines, identical `AGENT_ID` | They'd collude — `AGENT_ID` must be **unique per agent**. |
 
